@@ -1,0 +1,344 @@
+# Design Document: tpt-solver Suite (v2)
+
+## 1. Executive Summary
+
+tpt-solver is a high-performance constraint, SAT, and SMT solver suite, built entirely
+in pure Rust. It rejects two things at once: the traditional dependency on legacy C/C++
+solvers, and the assumption that a solver's *search algorithm* is what needs to be
+proven correct.
+
+Instead, tpt-solver is built on a **certificate architecture**: the search engine
+(CDCL, Simplex, heuristics) is untrusted and can be as complex and aggressively
+optimized as performance demands. Every answer it produces — SAT, UNSAT, or a
+theory conflict — comes with an independently checkable certificate. A small,
+separately-verified **checker kernel** is the only thing that has to be correct for
+the whole system's answers to be trustworthy. This is the same trusted-kernel
+principle behind LCF-style proof assistants (HOL, Isabelle) and behind how real SAT
+competitions certify solver output today (DRAT/LRAT proofs, checked by tools like
+`drat-trim` and the machine-verified `cake_lpr`).
+
+Formal verification (`tpt-telos`), Rust's type system, and structural memory
+management are all still used — but each is aimed at what it can actually prove,
+rather than asked to certify algorithm-level soundness it isn't built to express.
+
+## 2. Core Philosophy & Constraints
+
+1. **Pure Rust, Zero FFI.** No C/C++, no external binary wrappers.
+2. **Strict MIT-compatible license chain.** MIT, or dual MIT/Apache-2.0 with MIT
+   selected. No Apache-only or GPL dependencies.
+3. **Don't trust the solver — trust the certificate.** The search engine is free to
+   be heuristic, aggressive, and unverified. Correctness of *answers* comes from an
+   independent, minimal checker, not from proving the search algorithm.
+4. **Verify what's actually verifiable.** `tpt-telos` proves linear-arithmetic
+   contracts (bounds, no division-by-zero, budget/offset invariants). It is not used
+   to claim proofs of CDCL soundness, Simplex termination, or clause entailment —
+   those are proof-assistant-scale problems (see §5.1) and claiming otherwise would
+   be a false safety claim.
+5. **Differential and property testing are first-class, not a residual 10%.**
+   Empirically, this is the highest-yield bug-finding technique used by real SMT
+   solver teams, and it runs continuously, not just at a "final hardening" phase.
+
+## 3. Architecture Overview: Three-Tier Model
+
+```
+[ User Application / CLI / Python API / Wasm ]
+                 │
+                 ▼
+┌─────────────────────────────────────────────────┐
+│  tpt-solver (Periphery)                         │  <-- Minimal MIT deps
+│  - SMT-LIB2 / DIMACS / LP-MPS parsers, CLI, I/O │
+│  - E-graph pre-processing (egg)                 │
+│  - Fuzzed at the parser boundary (cargo-fuzz)   │
+└────────────────────┬────────────────────────────┘
+                     │ (answer + certificate)
+                     ▼
+┌─────────────────────────────────────────────────┐
+│  tpt-solver-core (The Engine — UNTRUSTED)       │  <-- Zero deps, no_std+alloc
+│  - CDCL SAT engine, DPLL(T), Simplex, FM        │
+│  - Heuristics: VSIDS, restarts, clause deletion │
+│  - Free to be complex; not the trust boundary   │
+│  - Hardened via Kani (bounded model checking)   │
+│  - Verified via differential testing vs Z3/CVC5 │
+└────────────────────┬────────────────────────────┘
+                     │ emits certificate
+                     ▼
+┌═════════════════════════════════════════════════┐
+║  tpt-solver-check (THE KERNEL — TRUSTED)        ║  <-- Zero deps, tiny, no_std
+║  - LRAT/DRAT proof checker (UNSAT)              ║
+║  - Farkas certificate checker (LRA UNSAT)       ║
+║  - Model re-evaluation (SAT: plug in & check)   ║
+║  - Small enough to formally verify end-to-end   ║
+║  * THIS is what tpt-telos contracts target *    ║
+╚═════════════════════════════════════════════════╝
+```
+
+The key structural change from v1: **the trusted surface area is now a separate,
+deliberately small crate**, not "the whole core." This is what makes formal
+verification of it actually tractable.
+
+## 4. Component Breakdown
+
+### 4.1. tpt-solver-check (The Kernel — trusted, tiny, formally targeted)
+
+This is the crate whose correctness the entire suite's guarantees rest on. It is
+kept as small as possible on purpose — every line here is a line that must be right.
+
+- **SAT / UNSAT certificate checking:** verifies LRAT proof traces (clause-by-clause
+  RUP/RAT checks against the original CNF). For SAT answers, simply substitutes the
+  returned assignment into the original formula and checks satisfaction — this
+  alone catches the overwhelming majority of "solver returned a wrong SAT answer"
+  bugs, at near-zero cost.
+- **LRA (Simplex/Fourier-Motzkin) certificate checking:** on UNSAT, verifies a
+  **Farkas certificate** — a nonnegative linear combination of the input constraints
+  that derives a direct contradiction (e.g. `0 < 0`). This is pure linear
+  arithmetic: a dot product and a sign check. On SAT, substitutes the returned
+  rational assignment into the original constraints.
+- **BitVector / Array theory checking:** analogous certificate-and-recheck strategy
+  once those theories are implemented — the guiding rule is: every theory solver in
+  `tpt-solver-core` must be paired with a checker in `tpt-solver-check` before it
+  ships, not proven correct in the abstract.
+- **This is the crate `tpt-telos` contracts apply to.** "This certificate check
+  never returns SAT for an actually-UNSAT input" is expressible as bounded linear
+  arithmetic over the certificate's coefficients — a legitimate fit for the
+  verifier, unlike CDCL soundness.
+
+### 4.2. tpt-solver-core (The Engine — untrusted, unconstrained by proof)
+
+This crate does the actual solving. It has no obligation to be provably correct on
+its own, because nothing downstream trusts it blindly — every answer is rechecked.
+That freedom is used to let this layer be aggressively optimized:
+
+- **Unified IR:** strongly-typed AST for Boolean logic, LRA, BitVectors, Arrays.
+- **Exact math:** `Rational`/`BigInt`. Rather than reinventing arbitrary-precision
+  arithmetic from scratch (a classic place for subtle, hard-to-find bugs — exactly
+  what this design is trying to prevent), use an existing dual MIT/Apache-2.0 crate
+  (e.g. `malachite`, or `num-bigint`/`num-rational`) and continuously differentially
+  test it. If a zero-runtime-dependency constraint truly requires a custom
+  implementation, it must be differentially fuzzed against a reference
+  implementation as a dev-dependency-only oracle from day one, not "hardened later."
+- **CDCL SAT engine:** two-watched-literals, VSIDS, restarts, clause deletion — free
+  to be as heuristically aggressive as needed, since its output is always
+  rechecked.
+- **DPLL(T) skeleton + theory solvers:** Simplex and Fourier-Motzkin for QF_LRA.
+- **Structural memory:** arenas + trail stacks for O(1) backtracking.
+- **Fuel system:** every loop consumes fuel; on depletion, return `Unknown` rather
+  than looping or panicking.
+- **Zero-panic mandate:** `#![deny(clippy::unwrap_used, clippy::panic)]`; every
+  fallible path returns `Result`/`Option`.
+
+### 4.3. tpt-solver (Periphery)
+
+Unchanged in spirit from v1 — parsers, CLI, e-graph preprocessing, serialization.
+This is the fuzzing target: `cargo-fuzz` against SMT-LIB2/DIMACS/LP-MPS parsers for
+malformed/truncated/malicious input, since parsers are exactly the kind of code
+fuzzing is best at and formal specs are poorly suited to.
+
+## 5. Safety & Hardening Strategy
+
+### 5.1. Why proof-of-algorithm is out of scope (and what is in scope)
+
+Proving CDCL/DPLL(T) soundness — "every learned clause is entailed by the original
+formula," "every UNSAT answer is correct" — as a property of the *search algorithm*
+is a real, solved problem in the formal-methods literature, but it's solved with
+full inductive theorem provers (Isabelle/HOL, Coq) reasoning over the algorithm's
+execution trace (see e.g. Blanchette et al.'s verified SAT solver work), not with a
+linear-arithmetic contract checker. Attempting to claim `tpt-telos` proves this
+would be a false statement about what the tool does.
+
+The certificate architecture in §3–4.1 sidesteps this entirely: instead of proving
+the algorithm correct, we prove (or at minimum, rigorously test) that **the checker
+correctly validates a certificate**, which is a much smaller and more tractable
+claim, actually expressible in `tpt-telos`'s QF_LRA fragment.
+
+### 5.2. tpt-telos, scoped to what it can prove
+
+- `tpt-solver-check`'s certificate arithmetic (Farkas combination validity, bounds
+  on coefficients).
+- Fuel accounting and arena/trail offset math in `tpt-solver-core`.
+- Any other genuinely linear-arithmetic invariant. Not a stand-in for full
+  algorithmic correctness anywhere in the stack.
+
+### 5.3. Kani, for the untrusted core's Rust-level safety
+
+`tpt-solver-core` gets `#[kani::proof]` harnesses directly on existing functions —
+no DSL, no transpile step. Targets: no arithmetic overflow, no out-of-bounds arena
+access, no panics, watched-literal bit manipulation correctness. This matches the
+core's actual bug surface (memory/index safety in hand-optimized code) far better
+than a contract language would.
+
+### 5.4. Differential and property testing, continuous
+
+- `proptest`/`quickcheck`-generated random formulas, solved by both
+  `tpt-solver-core` and a reference solver (Z3/CVC5 via bindings, dev-dependency
+  only), flagged on disagreement. This is the technique real solver teams lean on
+  most heavily to find soundness bugs in practice.
+- Runs in CI on every change, not reserved for a late "hardening phase."
+
+### 5.5. Type-level misuse prevention
+
+- Newtype IDs: `VarId(NonZeroU32)`, `ClauseId(NonZeroU32)` — raw `usize` forbidden.
+- **Generation/session-tagged IDs:** phantom-tag `VarId`/`ClauseId` to the specific
+  solver instance and incremental-solve generation they came from (not just
+  distinct from each other). A real bug class in incremental solvers is reusing an
+  ID from a prior push/pop context after backtracking; this makes it a compile
+  error instead of a silent logic bug.
+- Typestate for solver lifecycle (`Solver<Solving>` vs. `Solver<Model>`, etc.).
+
+### 5.6. Concurrency: avoid it in the core, use it at the periphery
+
+Rather than parallelizing inside CDCL (shared mutable state, an entire bug class of
+its own), run independent solver instances with different heuristics/seeds as a
+**parallel portfolio** — separate threads/processes, no shared state. If
+shared-state concurrency is ever introduced, it should go through `loom` for
+exhaustive interleaving testing before anything else.
+
+### 5.7. Targeted fuzzing
+
+Unchanged: `cargo-fuzz` on the SMT-LIB2/DIMACS parsers, plus SAT-COMP/SMT-COMP
+benchmark runs for heuristic/performance profiling — not for correctness, which is
+covered by §5.1–5.4.
+
+## 6. Operational Behavior: What Happens When the Checker Rejects
+
+The certificate architecture in §3–5 answers "how do we know an answer is correct."
+It does not by itself answer what the *system* does at the moment a certificate is
+rejected — that's a live product/ops question, not a proof question, and it needs
+its own explicit policy.
+
+### 6.1. Three-way checker outcome, not two
+
+`tpt-solver-check` reports one of three outcomes, not a binary accept/reject:
+
+- **Accept** — certificate verified; answer is trustworthy.
+- **Reject** — the certificate was structurally valid but does not actually
+  establish the claimed result (e.g. a Farkas combination that doesn't derive a
+  contradiction, an LRAT step that isn't a valid RUP/RAT inference). This is a real
+  bug signal from `tpt-solver-core`.
+- **Inconclusive** — the checker could not reach a verdict within its own resource
+  budget (fuel exhausted, malformed/truncated certificate, unsupported theory
+  combination). This is not evidence of a solver bug; it's evidence the checker or
+  its budget needs attention.
+
+Conflating reject and inconclusive hides which problem you actually have. A reject
+is "go file a bug against the core." An inconclusive is "check the checker's fuel
+budget or certificate format," a different and usually cheaper fix.
+
+### 6.2. Live-request fallback policy (tiered, fail-closed by default)
+
+Fail-open (trusting the solver anyway) is never an option — it silently
+reintroduces the exact failure mode the checker exists to catch, at the moment it's
+least affordable: a real answer reaching a real user. But fail-closed doesn't have
+to mean "return `Unknown` immediately." A tiered fallback, cheapest and safest first:
+
+1. **On a rejected SAT answer:** retry with a different seed/heuristic and recheck
+   the new model. Rechecking a model is cheap (linear in the number of
+   constraints), so this tier is close to free and resolves the common case.
+2. **On a rejected UNSAT/LRAT proof:** escalate faster rather than retry the same
+   search path — UNSAT proofs are the harder side to get right, and empirically
+   more likely to reflect a real bug in the current heuristic path rather than bad
+   luck.
+3. **Fallback to a simpler, more exhaustively-tested (but slower) solving path** for
+   this specific input — e.g. plain DPLL without aggressive heuristics, or
+   unoptimized Simplex — before giving up. Slower, but a much smaller bug surface,
+   so it's more likely to produce something the checker accepts.
+4. **`Unknown` is the true last resort**, returned only after the above are
+   exhausted or time out — not the first response to any single rejection.
+5. **Every rejection is dumped automatically** (input, certificate, which engine
+   path produced it, which tier of fallback was reached) for post-mortem. This is
+   mandatory infrastructure, not optional tooling — it's what turns a rejection
+   from a dead end into a bug report.
+
+### 6.3. Rejection rate as a first-class tracked metric
+
+A checker that never accepts a wrong answer but rarely accepts *any* answer is
+technically sound and practically worthless — "always return `Unknown`" passes
+every soundness property trivially. This means differential testing (§5.4) is doing
+double duty: finding soundness bugs, *and* measuring whether the solver is
+productive enough to be useful. Concretely:
+
+- **Track reject rate and inconclusive rate separately**, continuously, against the
+  differential-testing corpus (SAT-COMP/SMT-COMP inputs) in CI — not just at final
+  hardening. A heuristic change that spikes the reject rate is a regression, even
+  if no wrong answer ever reached a user, because it's degrading productivity while
+  staying safe.
+- **Set an explicit target threshold** (e.g. reject rate on the standard corpus
+  should stay below some small percentage) and gate merges on it, the same way
+  you'd gate on a benchmark latency regression.
+- **Weight production rejections far more heavily than corpus rejections.** A
+  rejection on live traffic means the differential/fuzz corpus had a gap — that's
+  informative about corpus coverage, not just about the solver.
+- Report reject/inconclusive/accept rates as a triad on every CI run and dashboard,
+  so "safe" and "useful" are both visible, not just the former.
+
+## 7. Technology Stack & Ecosystem
+
+| Component        | Crate / Implementation                         | License      | Location  |
+|-------------------|--------------------------------------------------|--------------|-----------|
+| Language          | Rust (core + alloc)                              | MIT          | Core      |
+| Exact math        | `malachite` or `num-bigint`/`num-rational`       | MIT/Apache   | Core      |
+| SAT/SMT logic     | Custom CDCL, DPLL(T), Simplex, Fourier-Motzkin    | MIT          | Core      |
+| Certificate check | Custom LRAT + Farkas checker                     | MIT          | Check     |
+| E-graphs          | `egg`                                            | MIT          | Periphery |
+| Serialization     | `rkyv` or `serde`                                | MIT          | Periphery |
+| CLI               | `clap`                                           | MIT          | Periphery |
+| Verification      | `tpt-telos` (certificate + arena/fuel arithmetic)| MIT          | Check/Core|
+| Model checking    | `kani`                                           | MIT/Apache   | Core      |
+| Differential test | `proptest`, Z3/CVC5 bindings (dev-only)          | MIT/Apache   | CI        |
+| Fuzzing           | `cargo-fuzz`                                     | MIT/Apache   | Periphery |
+| Concurrency test  | `loom` (if/when parallelism is introduced)       | MIT          | Core      |
+
+## 8. Phased Implementation Plan
+
+**Phase 1 — Foundation (Months 1–2)**
+- `tpt-solver-core` skeleton: `no_std`, exact-math types (via existing crate),
+  Unified IR with newtypes/typestate, arena + trail memory.
+- Stand up `tpt-solver-check` as its own crate from day one — not an afterthought.
+- Differential test harness against Z3 wired into CI immediately, even with a
+  near-empty solver, so it's exercising every commit from the start.
+- Reject/inconclusive/accept rate tracking (§6.3) wired into that same CI harness
+  from day one, so "safe but unproductive" regressions are visible from the first
+  commit that can emit a certificate, not bolted on later.
+
+**Phase 2 — SAT engine + first certificates (Months 3–4)**
+- CDCL (two-watched literals, VSIDS) in `tpt-solver-core`.
+- LRAT proof emission from the CDCL engine; LRAT checker in `tpt-solver-check`.
+- Kani harnesses on watched-literal and trail-backtracking code.
+- `tpt-telos` contracts on the checker's arithmetic.
+
+**Phase 3 — LRA theory + certificates (Months 5–6)**
+- Simplex + Fourier-Motzkin for QF_LRA in the core.
+- Farkas certificate emission and checking.
+- `tpt-telos` contracts on fuel accounting and Simplex pivot bounds (arithmetic
+  properties only — not pivot-rule soundness as an algorithm claim).
+
+**Phase 4 — Periphery & integration (Months 7–8)**
+- SMT-LIB2/DIMACS/LP-MPS parsers, `cargo-fuzz` from the start (not deferred).
+- `egg`-based e-graph preprocessing.
+- CLI and I/O.
+
+**Phase 5 — Advanced theories & hardening (Months 9–11)**
+- BitVector/Array theories in the core, matching checkers in `tpt-solver-check`.
+- Continued differential/property testing at scale; SAT-COMP/SMT-COMP benchmark
+  runs for performance, not correctness.
+- Full audit of `tpt-solver-check` specifically — this is the crate where "audit
+  every line" is actually feasible because it's kept small by design.
+
+## 9. Conclusion
+
+The change from v1 is a shift in where trust lives. Instead of asking one large,
+performance-critical crate to be both fast and formally proven — a combination
+that's historically taken proof-assistant teams years even for well-understood
+algorithms like DPLL — tpt-solver isolates trust into a small, dedicated checker
+that revalidates every answer, and lets the search engine be as complex and fast as
+it needs to be. Formal verification (`tpt-telos`), bounded model checking (Kani),
+and differential testing are each aimed at the layer they're actually suited to,
+rather than one tool being asked to carry a correctness claim it can't back up.
+
+Trusting a certificate instead of the search engine doesn't make the "solver
+rejects everything" failure mode disappear, though — it relocates it from a
+silent-wrong-answer problem into an explicit, observable one, with its own tiered
+fallback policy (§6.2) and its own tracked metric (§6.3). That relocation is the
+point: a visible, gated "reject rate" is a problem you can catch and fix in CI; a
+silent soundness bug in an unchecked solver is not. The result is a more honest,
+and I'd argue more genuinely hardened, path to the same goal the original design
+was reaching for.s

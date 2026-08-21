@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "tpt-solver-core",
+    "tpt-solver-check",
+    "tpt-solver",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["TPT Solutions"]
+repository = "https://github.com/tpt-solutions/tpt-solver"
+description = "High-performance constraint, SAT, and SMT solver suite with a certificate-checker architecture"
+
+[workspace.dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: Build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --workspace --verbose
+      - name: Test
+        run: cargo test --workspace --verbose
+      # Property/E2E verification (proptest invariants in `tpt-solver-core`,
+      # the certificate pipeline, DIMACS/SMT-LIB2 parsing), the internal
+      # differential harness (CDCL vs reference DPLL) and the reject/inconclusive/
+      # accept rate gate (spec §6.3) all run as part of `cargo test`.
+
+  differential-z3:
+    name: Differential vs Z3
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Z3
+        run: sudo apt-get update && sudo apt-get install -y z3
+      - name: Differential tests vs Z3 oracle
+        # `differential_vs_z3_when_available` shells out to `z3`; with Z3 installed
+        # it compares tpt-solver's claims against a real external oracle.
+        run: cargo test -p tpt-solver --lib differential:: --verbose
+
+  kani:
+    name: Kani proofs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Kani
+        run: cargo install kani && cargo kani setup
+      - name: Run Kani harnesses (core)
+        # `cargo kani` provides the `kani` crate and sets `cfg(kani)`; no Cargo
+        # dependency or feature flag is required.
+        run: cargo kani -p tpt-solver-core

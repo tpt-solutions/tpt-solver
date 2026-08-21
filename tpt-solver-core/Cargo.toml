@@ -1,0 +1,20 @@
+[package]
+name = "tpt-solver-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Untrusted but high-performance solving engine (CDCL, DPLL(T), Simplex) for the tpt-solver suite"
+
+[dependencies]
+
+[dev-dependencies]
+# Property-testing of the bounded linear-arithmetic invariants that `tpt-telos`
+# would target (fuel accounting, arena/trail offset math, literal packing).
+proptest = "1"
+
+[features]
+default = ["std"]
+std = []

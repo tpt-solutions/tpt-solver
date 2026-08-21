@@ -1,0 +1,16 @@
+[package]
+name = "tpt-solver-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.tpt-solver]
+path = ".."
+
+[workspace]

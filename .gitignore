@@ -1,0 +1,21 @@
+# Compiled output
+/target
+
+# Cargo
+**/*.rs.bk
+Cargo.lock
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Fuzzing artifacts
+fuzz/target
+fuzz/corpus
+fuzz/artifacts
+
+# Kani / verification output
+*.kani

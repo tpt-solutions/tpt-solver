@@ -1,0 +1,25 @@
+[package]
+name = "tpt-solver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Periphery for the tpt-solver suite: parsers, CLI, e-graph preprocessing, and integration glue"
+
+[lib]
+name = "tpt_solver"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tpt-solver"
+path = "src/main.rs"
+
+[dependencies]
+tpt-solver-core = { path = "../tpt-solver-core" }
+tpt-solver-check = { path = "../tpt-solver-check" }
+
+[features]
+default = ["std"]
+std = []
