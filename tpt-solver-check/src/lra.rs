@@ -4,12 +4,11 @@
 //!   constraints (with the certificate's nonnegative multipliers) must reduce to a
 //!   direct contradiction (`0 <= negative`). This is pure linear arithmetic: a dot
 //!   product and a sign check, exactly the bounded linear-arithmetic claim
-//! `tpt-telos` is suited to express.
+//!   `tpt-telos` is suited to express.
 //! * **SAT** — substitute a returned model into the original constraints and check
 //!   satisfaction (catches wrong-SAT-answer bugs at near-zero cost).
 
 use crate::outcome::Outcome;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use tpt_solver_core::lra::{FarkasCertificate, LinConstraint};
@@ -76,12 +75,16 @@ pub fn check_farkas(constraints: &[LinConstraint], cert: &FarkasCertificate) -> 
 /// and [`Outcome::Inconclusive`] on a length mismatch or arithmetic overflow.
 pub fn check_lra_model(constraints: &[LinConstraint], model: &[Rational]) -> Outcome {
     for c in constraints {
+        // A model shorter than this constraint's variable count is malformed
+        // relative to it — treat it the same as any other malformed input
+        // (`Inconclusive`), rather than silently defaulting the missing
+        // coordinates to zero, which could mask a real constraint violation.
+        if model.len() < c.coeffs.len() {
+            return Outcome::Inconclusive;
+        }
         let mut lhs = Rational::zero();
         for (j, coeff) in c.coeffs.iter().enumerate() {
-            let val = match model.get(j) {
-                Some(v) => *v,
-                None => Rational::zero(),
-            };
+            let val = model[j];
             let term = match coeff.mul(val) {
                 Some(t) => t,
                 None => return Outcome::Inconclusive,
@@ -139,6 +142,15 @@ mod tests {
         let cons = vec![c(&[1], 5), c(&[-1], 0)];
         let model = vec![Rational::from_i64(3)];
         assert!(check_lra_model(&cons, &model).is_accept());
+    }
+
+    #[test]
+    fn model_check_inconclusive_on_short_model() {
+        // Constraint over 2 variables, model only supplies 1 — malformed relative
+        // to this constraint, must not silently treat the missing one as zero.
+        let cons = vec![c(&[1, 1], 5)];
+        let model = vec![Rational::from_i64(3)];
+        assert!(check_lra_model(&cons, &model).is_inconclusive());
     }
 
     #[test]

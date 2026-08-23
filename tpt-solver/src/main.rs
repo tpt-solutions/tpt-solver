@@ -5,15 +5,18 @@
 //! tpt-solver                 # run built-in demo (reference + CDCL, both certified)
 //! tpt-solver FILE.cnf        # parse a DIMACS CNF, solve with CDCL, certify answer
 //! tpt-solver FILE.smt2       # parse an SMT-LIB2 script, solve (LRA or SAT), certify
+//! tpt-solver FILE.mps        # parse a free-format LP-MPS file, solve the LRA
+//!                             # feasibility system (no objective optimization), certify
 //! tpt-solver FILE.cnf --fuel N
 //! ```
 //!
 //! Every answer is revalidated by the trusted checker (`tpt-solver-check`); the
-//! printed verdict is what may actually be trusted. A richer CLI (`clap`) and the
-//! LP-MPS parser arrive in Phase 4.
+//! printed verdict is what may actually be trusted. A richer CLI (`clap`) arrives
+//! in a later phase.
 
 use tpt_solver::parsers::dimacs::parse_dimacs;
-use tpt_solver::parsers::smtlib2::{parse_script, SmtError};
+use tpt_solver::parsers::mps::parse_mps;
+use tpt_solver::parsers::smtlib2::{parse_script, LraProblem, SmtError};
 use tpt_solver::reference::{solve_and_check, solve_and_check_cdcl, solve_and_check_lra, Problem};
 use tpt_solver_check::outcome::Outcome;
 use tpt_solver_core::engine::SolveResult;
@@ -53,7 +56,41 @@ fn run_file(path: &str, fuel: u64) {
     if path.ends_with(".smt2") || path.ends_with(".smt") {
         return run_smtlib2(path, fuel);
     }
+    if path.ends_with(".mps") {
+        return run_mps(path, fuel);
+    }
     run_dimacs(path, fuel);
+}
+
+fn run_mps(path: &str, fuel: u64) {
+    let input = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot read '{}': {}", path, e);
+            std::process::exit(2);
+        }
+    };
+    let prob: LraProblem = match parse_mps(&input) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: failed to parse '{}': {}", path, e);
+            std::process::exit(2);
+        }
+    };
+    println!(
+        "parsed MPS: {} vars, {} constraints",
+        prob.var_count(),
+        prob.constraints.len()
+    );
+    let (claim, verdict) = solve_and_check_lra(&prob.constraints, fuel);
+    print_verdict("LRA engine", claim, verdict);
+    if claim == SolveResult::Sat {
+        let model = extract_lra_model(&prob.constraints);
+        println!(
+            "model: {:?}",
+            prob.vars.iter().zip(&model).collect::<Vec<_>>()
+        );
+    }
 }
 
 fn run_dimacs(path: &str, fuel: u64) {
@@ -120,7 +157,10 @@ fn run_smtlib2(path: &str, fuel: u64) {
             print_verdict("LRA engine", claim, verdict);
             if claim == SolveResult::Sat {
                 let model = extract_lra_model(&prob.constraints);
-                println!("model: {:?}", prob.vars.iter().zip(&model).collect::<Vec<_>>());
+                println!(
+                    "model: {:?}",
+                    prob.vars.iter().zip(&model).collect::<Vec<_>>()
+                );
             }
             return;
         }
@@ -136,7 +176,10 @@ fn run_smtlib2(path: &str, fuel: u64) {
     let problem = match script.to_cnf() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("error: could not lower script ({}); only QF_LRA and QF_SAT subsets are supported", e);
+            eprintln!(
+                "error: could not lower script ({}); only QF_LRA and QF_SAT subsets are supported",
+                e
+            );
             std::process::exit(2);
         }
     };
@@ -150,7 +193,9 @@ fn run_smtlib2(path: &str, fuel: u64) {
 }
 
 /// Best-effort extraction of an LRA model for display (re-uses the core's Simplex).
-fn extract_lra_model(constraints: &[tpt_solver_core::lra::LinConstraint]) -> Vec<tpt_solver_core::rational::Rational> {
+fn extract_lra_model(
+    constraints: &[tpt_solver_core::lra::LinConstraint],
+) -> Vec<tpt_solver_core::rational::Rational> {
     match tpt_solver_core::lra::lra_model(constraints) {
         Some(Some(m)) => m,
         _ => Vec::new(),

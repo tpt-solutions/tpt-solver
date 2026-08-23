@@ -16,10 +16,12 @@
 //! oracle; it is a no-op where `z3` is absent so the suite stays green offline.
 
 use crate::policy::VerdictTracker;
-use crate::reference::{solve_and_check, solve_and_check_cdcl, Problem};
+use crate::reference::{solve_and_check, solve_and_check_cdcl, solve_and_check_lra, Problem};
 use std::process::Command;
 use tpt_solver_check::outcome::Outcome;
 use tpt_solver_core::engine::SolveResult;
+use tpt_solver_core::lra::LinConstraint;
+use tpt_solver_core::rational::Rational;
 
 /// Deterministic LCG so the corpus is reproducible across runs and CI.
 struct Lcg(u64);
@@ -148,16 +150,52 @@ fn problem_to_smt2(p: &Problem) -> String {
     s
 }
 
+/// Whether the `z3` binary is available on `PATH`.
+fn z3_present() -> bool {
+    matches!(
+        Command::new("z3").arg("-version").output(),
+        Ok(o) if o.status.success()
+    )
+}
+
+/// Run `z3` on an SMT-LIB2 script and parse its `sat`/`unsat` verdict. `None` if
+/// `z3` couldn't be run, or answered `unknown` / produced no clear verdict.
+fn run_z3(smt2: &str) -> Option<SolveResult> {
+    let output = Command::new("z3")
+        .arg("-in")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(smt2.as_bytes())
+                .ok();
+            child.wait_with_output()
+        })
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.lines().find_map(|l| {
+        let t = l.trim();
+        if t == "sat" {
+            Some(SolveResult::Sat)
+        } else if t == "unsat" {
+            Some(SolveResult::Unsat)
+        } else {
+            None
+        }
+    })
+}
+
 /// Differential testing against Z3 (spec §5.4). Runs only when the `z3` binary is on
 /// `PATH`; otherwise it is a no-op so the suite stays green where Z3 is absent (e.g.
 /// local machines). CI installs Z3 to exercise this lane for real.
 #[test]
 fn differential_vs_z3_when_available() {
-    let z3_present = match Command::new("z3").arg("-version").output() {
-        Ok(o) if o.status.success() => true,
-        _ => false,
-    };
-    if !z3_present {
+    if !z3_present() {
         eprintln!("z3 not found on PATH; skipping Z3 differential test");
         return;
     }
@@ -170,38 +208,9 @@ fn differential_vs_z3_when_available() {
         let p = gen_problem(&mut rng, vars, clauses as usize, width as usize);
         let smt2 = problem_to_smt2(&p);
 
-        let output = Command::new("z3")
-            .arg("-in")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                use std::io::Write;
-                child
-                    .stdin
-                    .as_mut()
-                    .unwrap()
-                    .write_all(smt2.as_bytes())
-                    .ok();
-                child.wait_with_output()
-            });
-        let output = match output {
-            Ok(o) => o,
-            Err(_) => continue,
-        };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let z3_claim = match stdout.lines().find_map(|l| {
-            let t = l.trim();
-            if t == "sat" {
-                Some(SolveResult::Sat)
-            } else if t == "unsat" {
-                Some(SolveResult::Unsat)
-            } else {
-                None
-            }
-        }) {
+        let z3_claim = match run_z3(&smt2) {
             Some(c) => c,
-            None => continue, // z3 said "unknown" or produced no clear verdict
+            None => continue,
         };
 
         let (claim, verdict) = solve_and_check_cdcl(&p, 200_000);
@@ -213,6 +222,94 @@ fn differential_vs_z3_when_available() {
         assert!(
             verdict.is_accept(),
             "checker did not Accept the CDCL verdict vs Z3: {:?}",
+            verdict
+        );
+    }
+}
+
+/// Generate a random small QF_LRA system: `n_cons` constraints over `n_vars`
+/// variables, small integer coefficients/RHS so the generated SMT-LIB2 script
+/// stays simple. Returned as raw `(coeffs, rhs)` pairs so the caller can both
+/// build a [`LinConstraint`] system and serialize the identical numbers to
+/// SMT-LIB2 without going through `Rational` (which has no public accessors).
+fn gen_lra_problem(rng: &mut Lcg, n_vars: usize, n_cons: usize) -> Vec<(Vec<i64>, i64)> {
+    let mut cons = Vec::with_capacity(n_cons);
+    for _ in 0..n_cons {
+        let coeffs: Vec<i64> = (0..n_vars).map(|_| rng.below(11) as i64 - 5).collect();
+        let rhs = rng.below(21) as i64 - 10;
+        cons.push((coeffs, rhs));
+    }
+    cons
+}
+
+fn lra_to_constraints(cons: &[(Vec<i64>, i64)]) -> Vec<LinConstraint> {
+    cons.iter()
+        .map(|(coeffs, rhs)| LinConstraint {
+            coeffs: coeffs.iter().map(|&c| Rational::from_i64(c)).collect(),
+            rhs: Rational::from_i64(*rhs),
+        })
+        .collect()
+}
+
+/// An SMT-LIB2 integer literal, using `(- n)` for negatives per the SMT-LIB2
+/// grammar (a bare `-3` numeral is not valid syntax).
+fn smt2_int(v: i64) -> String {
+    if v < 0 {
+        format!("(- {})", -v)
+    } else {
+        v.to_string()
+    }
+}
+
+/// Serialize a random LRA system as a QF_LRA SMT-LIB2 script for an external oracle.
+fn lra_to_smt2(cons: &[(Vec<i64>, i64)], n_vars: usize) -> String {
+    let mut s = String::from("(set-logic QF_LRA)\n");
+    for i in 0..n_vars {
+        s.push_str(&format!("(declare-fun x{i} () Real)\n"));
+    }
+    for (coeffs, rhs) in cons {
+        let mut lhs = String::from("(+ 0");
+        for (i, &c) in coeffs.iter().enumerate() {
+            lhs.push_str(&format!(" (* {} x{})", smt2_int(c), i));
+        }
+        lhs.push(')');
+        s.push_str(&format!("(assert (<= {} {}))\n", lhs, smt2_int(*rhs)));
+    }
+    s.push_str("(check-sat)\n");
+    s
+}
+
+/// Differential testing of the LRA path against Z3 (spec §5.4). Runs only when `z3`
+/// is on `PATH`; otherwise a no-op, mirroring [`differential_vs_z3_when_available`].
+#[test]
+fn differential_lra_vs_z3_when_available() {
+    if !z3_present() {
+        eprintln!("z3 not found on PATH; skipping Z3 LRA differential test");
+        return;
+    }
+
+    let mut rng = Lcg(0xabcd_ef01);
+    for _ in 0..40 {
+        let n_vars = 1 + rng.below(3) as usize;
+        let n_cons = 1 + rng.below(4) as usize;
+        let raw = gen_lra_problem(&mut rng, n_vars, n_cons);
+        let cons = lra_to_constraints(&raw);
+        let smt2 = lra_to_smt2(&raw, n_vars);
+
+        let z3_claim = match run_z3(&smt2) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let (claim, verdict) = solve_and_check_lra(&cons, 200_000);
+        assert_eq!(
+            claim, z3_claim,
+            "disagreement with Z3 on LRA system: {:?}",
+            raw
+        );
+        assert!(
+            verdict.is_accept(),
+            "checker did not Accept the LRA verdict vs Z3: {:?}",
             verdict
         );
     }

@@ -141,7 +141,35 @@ impl CdclSolver {
         true
     }
 
+    /// Dedupe literals and detect tautologies. Returns `None` for a tautology
+    /// (contains both `l` and `-l`), `Some(deduped)` otherwise (order-preserving,
+    /// first occurrence wins).
+    fn normalize_clause(lits: &[i32]) -> Option<Vec<i32>> {
+        let mut out: Vec<i32> = Vec::with_capacity(lits.len());
+        for &l in lits {
+            if out.contains(&-l) {
+                return None;
+            }
+            if !out.contains(&l) {
+                out.push(l);
+            }
+        }
+        Some(out)
+    }
+
     fn add_clause(&mut self, lits: &[i32]) -> bool {
+        // Normalize first: dedupe repeated literals and drop tautologies (a clause
+        // containing both `l` and `-l` is trivially satisfied and adds no
+        // constraint). Without this, a duplicated literal ends up watched twice
+        // from the *same* watcher bucket (`lit_code(lits[0]) == lit_code(lits[1])`),
+        // and the second, now-stale watcher entry corrupts propagation once the
+        // first entry triggers a swap — a real soundness bug caught by differential
+        // testing (CDCL claiming Sat with a model the checker rejects).
+        let lits = match Self::normalize_clause(lits) {
+            Some(l) => l,
+            None => return true, // tautology: trivially satisfied, nothing to add
+        };
+        let lits = lits.as_slice();
         // Returns false only if an empty clause is given (immediate UNSAT).
         if lits.is_empty() {
             return false;
@@ -238,12 +266,22 @@ impl CdclSolver {
         Prop::Ok
     }
 
+    /// First-UIP conflict analysis (MiniSat-style).
+    ///
+    /// Only literals from levels *below* the current one are collected into
+    /// the learnt clause; current-level literals merely count toward `pathC`
+    /// and are represented by the final pivot (`learnt[0] = ¬p`). Collecting
+    /// current-level literals too would yield clauses that are implied but
+    /// *not asserting* — they backtrack nowhere, fail to enqueue, and break
+    /// the RUP chain the kernel re-validates.
+    ///
+    /// Returns an empty clause as a bail-out signal if the reason chain is
+    /// malformed (the caller backtracks to level 0 without learning).
     fn analyze(&mut self, confl: usize) -> (Vec<i32>, usize) {
         let n = self.n_vars as usize;
         let mut seen = vec![false; n + 1];
-        let mut out_learnt: Vec<i32> = Vec::new();
-        out_learnt.push(0); // placeholder for asserting literal
-        let mut out_btlevel: usize = 0;
+        let mut learnt: Vec<i32> = Vec::new();
+        let mut btlevel: usize = 0;
         let mut index = self.trail.len();
         let mut path_c: i32 = 0;
         let mut p: i32 = 0;
@@ -256,49 +294,44 @@ impl CdclSolver {
                 let q = cl[j];
                 let v = q.unsigned_abs() as usize;
                 if !seen[v] && self.level[v - 1] > 0 {
-                    self.bump_var_activity(v - 1);
                     seen[v] = true;
+                    self.bump_var_activity(v - 1);
                     if (self.level[v - 1] as usize) >= self.decision_level() {
                         path_c += 1;
+                    } else {
+                        learnt.push(q);
+                        let lv = self.level[v - 1] as usize;
+                        if lv > btlevel {
+                            btlevel = lv;
+                        }
                     }
-                    out_learnt.push(q);
                 }
                 j += 1;
             }
+            // Most recent seen literal on the trail.
             loop {
+                if index == 0 {
+                    // Malformed reason chain; bail out (caller restarts at 0).
+                    return (Vec::new(), 0);
+                }
                 index -= 1;
                 p = self.trail[index];
                 if seen[p.unsigned_abs() as usize] {
                     break;
                 }
             }
-            let pv = (p.unsigned_abs() as usize) - 1;
-            seen[pv + 1] = false;
+            seen[p.unsigned_abs() as usize] = false;
             path_c -= 1;
-            if path_c > 0 {
-                match self.reason[pv] {
-                    Some(r) => conflict_clause = r,
-                    None => break,
-                }
-            } else {
+            if path_c <= 0 {
                 break;
             }
-        }
-        out_learnt[0] = Self::negate(p);
-        let mut i = 1;
-        while i < out_learnt.len() {
-            let lv = self.level[(out_learnt[i].unsigned_abs() as usize) - 1] as usize;
-            if lv > out_btlevel {
-                out_btlevel = lv;
+            match self.reason[(p.unsigned_abs() as usize) - 1] {
+                Some(r) => conflict_clause = r,
+                None => break, // decision var mid-path: bail out
             }
-            i += 1;
         }
-        let mut i = 0;
-        while i < out_learnt.len() {
-            seen[out_learnt[i].unsigned_abs() as usize] = false;
-            i += 1;
-        }
-        (out_learnt, out_btlevel)
+        learnt.insert(0, Self::negate(p));
+        (learnt, btlevel)
     }
 
     fn cancel_until(&mut self, level: usize) {
@@ -319,6 +352,15 @@ impl CdclSolver {
                 self.unassigned += 1;
             }
             self.trail_lim.pop();
+        }
+        // Backtracking popped already-trailed literals; anything between the
+        // new trail length and the old propagation head was cancelled and
+        // must never be propagated. Without clamping, the head can sit past
+        // the trail end so `propagate` becomes a no-op, decisions fill every
+        // remaining variable, and the search returns "Sat" with a model that
+        // violates clauses — caught by the bit-vector certification tests.
+        if self.propagate_head > self.trail.len() {
+            self.propagate_head = self.trail.len();
         }
     }
 
@@ -358,15 +400,23 @@ impl CdclSolver {
         self.enqueue(lit, None);
     }
 
-    fn add_learnt(&mut self, lits: &[i32]) {
+    /// Add a learnt clause and enqueue its asserting literal.
+    ///
+    /// Returns `false` when the learnt clause is already falsified under the
+    /// current assignment — a level-0 contradiction (the asserting literal is
+    /// assigned the wrong way), which the caller must surface as UNSAT.
+    /// Swallowing that failure lets the search continue from a violated
+    /// learnt clause and eventually claim `Sat` with a model violating the
+    /// *original* clauses — a soundness bug caught by the bit-vector
+    /// certification tests.
+    fn add_learnt(&mut self, lits: &[i32]) -> bool {
         if lits.is_empty() {
             self.proof.push(Vec::new());
-            return;
+            return false;
         }
         if lits.len() == 1 {
             self.proof.push(lits.to_vec());
-            self.enqueue(lits[0], None);
-            return;
+            return self.enqueue(lits[0], None);
         }
         let idx = self.clauses.len();
         self.clauses.push(Clause {
@@ -388,11 +438,20 @@ impl CdclSolver {
             blocking: l0,
         });
         self.proof.push(lits.to_vec());
-        // Enqueue the asserting literal (lits[0]).
-        let _ = self.enqueue(l0, Some(idx));
+        // Enqueue the asserting literal (lits[0]); failure = falsified learnt.
+        self.enqueue(l0, Some(idx))
     }
 
-    fn reduce_db(&mut self) {
+    /// Delete half of the learnt clauses (lowest activity) and rebuild the
+    /// watcher lists.
+    ///
+    /// Returns `false` when a survivor clause is falsified by the (level-0)
+    /// current assignment — an immediate UNSAT. The rebuild must watch
+    /// non-false literals where possible: blindly watching `lits[0..2]` can
+    /// pick two already-false literals, after which the clause is never
+    /// visited again even when it should propagate or conflict — a soundness
+    /// bug (bogus `Sat` models) caught by the bit-vector certification tests.
+    fn reduce_db(&mut self) -> bool {
         let mut learnt_acts: Vec<f64> = Vec::new();
         for c in self.clauses.iter() {
             if c.learnt {
@@ -400,43 +459,90 @@ impl CdclSolver {
             }
         }
         let limit = (self.n_vars as f64) * 4.0 + 16.0;
-        if (learnt_acts.len() as f64) <= limit {
-            return;
+        if (learnt_acts.len() as f64) > limit {
+            learnt_acts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+            let cutoff = learnt_acts[learnt_acts.len() / 2];
+            let kept: Vec<Clause> = self
+                .clauses
+                .iter()
+                .filter(|c| !c.learnt || c.activity >= cutoff)
+                .cloned()
+                .collect();
+            self.clauses = kept;
         }
-        learnt_acts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
-        let cutoff = learnt_acts[learnt_acts.len() / 2];
-        let kept: Vec<Clause> = self
-            .clauses
-            .iter()
-            .filter(|c| !c.learnt || c.activity >= cutoff)
-            .cloned()
-            .collect();
-        self.clauses = kept;
         self.watchers = vec![Vec::new(); 2 * self.n_vars as usize];
         let mut idx = 0;
         while idx < self.clauses.len() {
             let len = self.clauses[idx].lits.len();
             if len >= 2 {
-                let l0 = self.clauses[idx].lits[0];
-                let l1 = self.clauses[idx].lits[1];
-                let code0 = self.lit_code(l0);
-                let code1 = self.lit_code(l1);
-                self.watchers[code0].push(Watcher {
-                    clause: idx,
-                    blocking: l1,
-                });
-                self.watchers[code1].push(Watcher {
-                    clause: idx,
-                    blocking: l0,
-                });
+                let mut lits = self.clauses[idx].lits.clone();
+                // Find up to two literals that are not false under the
+                // permanent (level-0) assignment.
+                let mut picks: Vec<i32> = Vec::with_capacity(2);
+                for &l in lits.iter() {
+                    if !self.is_false(l) && !picks.contains(&l) {
+                        picks.push(l);
+                        if picks.len() == 2 {
+                            break;
+                        }
+                    }
+                }
+                match picks.len() {
+                    0 => return false, // falsified at level 0: immediate UNSAT
+                    1 => {
+                        // Unit or satisfied-and-permanent: enqueue at level 0
+                        // and watch the single literal twice.
+                        let u = picks[0];
+                        let _ = self.enqueue(u, None);
+                        if let Some(p) = lits.iter().position(|&x| x == u) {
+                            lits.swap(0, p);
+                        }
+                        self.clauses[idx].lits = lits;
+                        let code = self.lit_code(u);
+                        self.watchers[code].push(Watcher {
+                            clause: idx,
+                            blocking: u,
+                        });
+                        self.watchers[code].push(Watcher {
+                            clause: idx,
+                            blocking: u,
+                        });
+                    }
+                    _ => {
+                        let l0 = picks[0];
+                        let l1 = picks[1];
+                        if let Some(p0) = lits.iter().position(|&x| x == l0) {
+                            lits.swap(0, p0);
+                        }
+                        let mut p1 = lits.iter().position(|&x| x == l1).unwrap_or(1);
+                        if p1 == 0 {
+                            p1 = 1;
+                        }
+                        lits.swap(1, p1);
+                        self.clauses[idx].lits = lits;
+                        let code0 = self.lit_code(l0);
+                        let code1 = self.lit_code(l1);
+                        self.watchers[code0].push(Watcher {
+                            clause: idx,
+                            blocking: l1,
+                        });
+                        self.watchers[code1].push(Watcher {
+                            clause: idx,
+                            blocking: l0,
+                        });
+                    }
+                }
             } else if len == 1 {
                 let _ = self.enqueue(self.clauses[idx].lits[0], None);
             }
             idx += 1;
         }
+        true
     }
 
-    fn restart(&mut self) {
+    /// Backtrack to level 0, age activities, and prune learnt clauses.
+    /// Returns `false` when the prune reveals a level-0 falsified clause.
+    fn restart(&mut self) -> bool {
         self.cancel_until(0);
         self.restart_limit = ((self.restart_limit as f64) * 1.5) as u32 + 1;
         let mut i = 0;
@@ -444,7 +550,7 @@ impl CdclSolver {
             self.activity[i] *= 0.95;
             i += 1;
         }
-        self.reduce_db();
+        self.reduce_db()
     }
 
     fn search(&mut self) -> SolveResult {
@@ -457,10 +563,11 @@ impl CdclSolver {
                     if self.unassigned == 0 {
                         return SolveResult::Sat;
                     }
-                    self.decide();
-                    if self.conflicts >= self.restart_limit {
-                        self.restart();
+                    if self.conflicts >= self.restart_limit && !self.restart() {
+                        self.proof.push(Vec::new());
+                        return SolveResult::Unsat;
                     }
+                    self.decide();
                 }
                 Prop::Conflict(c) => {
                     self.conflicts += 1;
@@ -469,8 +576,20 @@ impl CdclSolver {
                         return SolveResult::Unsat;
                     }
                     let (learnt, btlevel) = self.analyze(c);
-                    self.cancel_until(btlevel);
-                    self.add_learnt(&learnt);
+                    if learnt.is_empty() {
+                        // Malformed reason chain: honest backtrack to the
+                        // root without learning (fuel bounds the search).
+                        self.cancel_until(0);
+                    } else {
+                        self.cancel_until(btlevel);
+                        if !self.add_learnt(&learnt) {
+                            // The learnt clause is already falsified: a
+                            // level-0 contradiction derived from the original
+                            // clauses.
+                            self.proof.push(Vec::new());
+                            return SolveResult::Unsat;
+                        }
+                    }
                 }
                 Prop::Fuel => return SolveResult::Unknown,
             }

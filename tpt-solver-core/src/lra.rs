@@ -13,7 +13,10 @@ use alloc::vec::Vec;
 /// A linear constraint in canonical `<=` form: `Σ coeffs[i]·x_i <= rhs`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinConstraint {
+    /// Coefficient of each variable, in a fixed variable order shared by every
+    /// constraint in the system.
     pub coeffs: Vec<Rational>,
+    /// The right-hand side of the `<=` bound.
     pub rhs: Rational,
 }
 
@@ -21,6 +24,7 @@ pub struct LinConstraint {
 /// weighted sum of the constraints yields a direct contradiction (`0 <= negative`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FarkasCertificate {
+    /// One nonnegative multiplier per original constraint, in input order.
     pub multipliers: Vec<Rational>,
 }
 
@@ -166,8 +170,8 @@ impl Tableau {
             row[n_struct + i] = Rational::from_i64(1);
             let mut rhs = c.rhs;
             if rhs.is_negative() {
-                for k in 0..ncols {
-                    row[k] = row[k].neg();
+                for cell in row[..ncols].iter_mut() {
+                    *cell = cell.neg();
                 }
                 rhs = rhs.neg();
                 row[art_start + i] = Rational::from_i64(1);
@@ -222,9 +226,17 @@ impl Tableau {
             // `obj[c] > 0` in our `z = obj_rhs - Σ obj[c]·x_c` tableau), so increasing it
             // lowers the phase-1 objective (the sum of artificials). It must also have
             // a positive pivot to keep the basis feasible.
+            //
+            // Artificial columns are excluded here: `obj[c]` is only a valid reduced
+            // cost for columns with true phase-1 cost 0 (`c_j - z_j = -z_j = obj[c]`).
+            // Artificials have cost 1, so their real reduced cost is `1 - obj[c]`, not
+            // `obj[c]` — treating them the same way would let a nonbasic artificial
+            // with `0 < obj[c] <= 1` look "improving" and re-enter the basis, which
+            // only reintroduces infeasibility it already left. Once an original
+            // constraint's artificial has been driven out, it should never come back.
             let mut entering: Option<usize> = None;
             let mut best = Rational::zero();
-            for c in 0..self.ncols {
+            for c in 0..self.art_start {
                 if self.basis.contains(&c) {
                     continue;
                 }
@@ -247,9 +259,8 @@ impl Tableau {
                     // No pivotable improving column. If any improving column exists at
                     // all the objective is unbounded below => infeasible; otherwise we
                     // have reached optimality.
-                    let unbounded = (0..self.ncols).any(|c| {
-                        !self.basis.contains(&c) && obj[c].is_positive()
-                    });
+                    let unbounded = (0..self.art_start)
+                        .any(|c| !self.basis.contains(&c) && obj[c].is_positive());
                     if unbounded {
                         return Some(None);
                     }
@@ -267,10 +278,7 @@ impl Tableau {
                 if piv.is_zero() {
                     continue;
                 }
-                let ratio = match self.rows[p][self.ncols].checked_div(piv) {
-                    Some(r) => r,
-                    None => return None,
-                };
+                let ratio = self.rows[p][self.ncols].checked_div(piv)?;
                 match best_ratio {
                     None => {
                         best_ratio = Some(ratio);
@@ -372,7 +380,7 @@ pub fn lra_model(constraints: &[LinConstraint]) -> Option<Option<Vec<Rational>>>
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -390,7 +398,10 @@ mod tests {
         match fourier_motzkin(&cons) {
             Some(FmResult::Unsat(cert)) => {
                 // certificate should be [1, 1]: 1*(x>=1) + 1*(x<=0) => 0 <= -1
-                assert_eq!(cert.multipliers, vec![Rational::from_i64(1), Rational::from_i64(1)]);
+                assert_eq!(
+                    cert.multipliers,
+                    vec![Rational::from_i64(1), Rational::from_i64(1)]
+                );
             }
             other => panic!("expected Unsat, got {:?}", other),
         }
@@ -438,9 +449,7 @@ mod tests {
         assert!(x.cmp(Rational::from_i64(10)) != core::cmp::Ordering::Greater);
         assert!(y.cmp(Rational::from_i64(0)) != core::cmp::Ordering::Less);
         assert!(y.cmp(Rational::from_i64(10)) != core::cmp::Ordering::Greater);
-        assert!(
-            x.add(y).unwrap().cmp(Rational::from_i64(15)) != core::cmp::Ordering::Greater
-        );
+        assert!(x.add(y).unwrap().cmp(Rational::from_i64(15)) != core::cmp::Ordering::Greater);
     }
 
     #[test]

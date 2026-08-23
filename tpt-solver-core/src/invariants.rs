@@ -10,8 +10,17 @@
 
 use crate::fuel::Fuel;
 use crate::ir::{Lit, VarId};
+use crate::lra::{lra_model, LinConstraint};
 use crate::memory::{Arena, Trail};
+use crate::rational::Rational;
 use proptest::prelude::*;
+
+fn mk_constraint(coeffs: &[i64], rhs: i64) -> LinConstraint {
+    LinConstraint {
+        coeffs: coeffs.iter().map(|&c| Rational::from_i64(c)).collect(),
+        rhs: Rational::from_i64(rhs),
+    }
+}
 
 proptest! {
     /// Fuel is conserved by `split`: the child's remaining plus the parent's
@@ -74,5 +83,33 @@ proptest! {
         }
         a.reset(w);
         prop_assert_eq!(a.len(), items.len());
+    }
+
+    /// Simplex is pivot-bounded (`lra_model`'s iteration ceiling in `lra.rs` is a
+    /// hard loop cap, so this always terminates) and self-consistent: whenever it
+    /// does report a model, that model actually satisfies every original
+    /// constraint. This is the runtime property-testing stand-in for the
+    /// `tpt-telos` "Simplex pivot bounds" contract (spec §5.2) — `tpt-telos` is a
+    /// separate external tool (see Phase 2/3 notes), so the bounded-arithmetic
+    /// property it would have proven is discharged here instead.
+    #[test]
+    fn lra_model_terminates_and_is_self_consistent(
+        a in proptest::collection::vec(-5i64..=5, 6),
+        r in proptest::collection::vec(-10i64..=10, 3),
+    ) {
+        let cons = vec![
+            mk_constraint(&a[0..2], r[0]),
+            mk_constraint(&a[2..4], r[1]),
+            mk_constraint(&a[4..6], r[2]),
+        ];
+        if let Some(Some(model)) = lra_model(&cons) {
+            for c in &cons {
+                let mut sum = Rational::zero();
+                for (coef, x) in c.coeffs.iter().zip(model.iter()) {
+                    sum = sum.add(coef.mul(*x).unwrap()).unwrap();
+                }
+                prop_assert!(sum.cmp(c.rhs) != core::cmp::Ordering::Greater);
+            }
+        }
     }
 }

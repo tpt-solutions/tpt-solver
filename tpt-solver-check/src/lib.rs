@@ -27,6 +27,8 @@
 
 extern crate alloc;
 
+pub mod array;
+pub mod bv;
 pub mod lra;
 pub mod lrat;
 pub mod outcome;

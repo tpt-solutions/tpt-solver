@@ -10,14 +10,13 @@
 //! Every answer it produces is still validated by [`tpt_solver_check`]; nothing here
 //! is trusted blindly.
 
-use tpt_solver_check::lrat::{check_proof, LratProof, LratStep};
 use tpt_solver_check::lra::check_farkas;
+use tpt_solver_check::lrat::{check_proof, LratProof, LratStep};
 use tpt_solver_check::outcome::Outcome;
 use tpt_solver_check::sat::{check_model, Cnf, Model};
 use tpt_solver_core::engine::SolveResult;
 use tpt_solver_core::ir::{Lit, VarId};
 use tpt_solver_core::lra::{fourier_motzkin, FmResult, LinConstraint};
-use tpt_solver_core::rational::Rational;
 
 /// A formula in simple (non-branded) CNF: each literal is `var` (positive) or `-var`
 /// (negative), `var` in `1..=var_count`.
@@ -277,10 +276,63 @@ pub fn solve_and_check_lra(constraints: &[LinConstraint], _fuel: u64) -> (SolveR
     }
 }
 
+/// Solve a QF_BV problem (bit-blasting onto CDCL) and validate through the
+/// trusted kernel.
+///
+/// * **UNSAT** — the kernel re-validates the CDCL proof over the shipped blast
+///   via [`tpt_solver_check::bv::check_bv_unsat`].
+/// * **SAT** — the decoded word model is re-evaluated against the original
+///   assertions by [`tpt_solver_check::bv::check_bv_model`].
+pub fn solve_and_check_bv(
+    var_count: u32,
+    assertions: &[tpt_solver_core::bv::BvAssertion],
+    fuel: u64,
+) -> (SolveResult, Outcome) {
+    match tpt_solver_core::bv::solve_bv(var_count, assertions, fuel) {
+        Some(tpt_solver_core::bv::BvOutcome::Sat(model)) => {
+            let verdict = tpt_solver_check::bv::check_bv_model(assertions, &model, var_count);
+            (SolveResult::Sat, verdict)
+        }
+        Some(tpt_solver_core::bv::BvOutcome::Unsat(cert)) => {
+            let verdict = tpt_solver_check::bv::check_bv_unsat(&cert);
+            (SolveResult::Unsat, verdict)
+        }
+        None => (SolveResult::Unknown, Outcome::Inconclusive),
+    }
+}
+
+/// Solve a QF_AX (array) problem and validate through the trusted kernel.
+///
+/// * **UNSAT** — the axiom-instance certificate is replayed by
+///   [`tpt_solver_check::array::check_ax_unsat`].
+/// * **SAT** — the concrete model is re-evaluated by
+///   [`tpt_solver_check::array::check_array_model`].
+pub fn solve_and_check_arrays(
+    avar_count: u32,
+    evar_count: u32,
+    assertions: &[tpt_solver_core::array::ArrAssertion],
+    fuel: u64,
+) -> (SolveResult, Outcome) {
+    match tpt_solver_core::array::solve_arrays(avar_count, evar_count, assertions, fuel) {
+        Some(tpt_solver_core::array::AxOutcome::Sat(model)) => {
+            let verdict = tpt_solver_check::array::check_array_model(
+                assertions, &model, avar_count, evar_count,
+            );
+            (SolveResult::Sat, verdict)
+        }
+        Some(tpt_solver_core::array::AxOutcome::Unsat(cert)) => {
+            let verdict = tpt_solver_check::array::check_ax_unsat(assertions, &cert);
+            (SolveResult::Unsat, verdict)
+        }
+        None => (SolveResult::Unknown, Outcome::Inconclusive),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use tpt_solver_core::rational::Rational;
 
     #[test]
     fn sat_example() {
@@ -344,7 +396,10 @@ mod tests {
         ];
         let (claim, verdict) = solve_and_check_lra(&cons, 1_000_000);
         assert_eq!(claim, SolveResult::Unsat);
-        assert!(verdict.is_accept(), "kernel should Accept the Farkas certificate");
+        assert!(
+            verdict.is_accept(),
+            "kernel should Accept the Farkas certificate"
+        );
     }
 
     #[test]
@@ -374,6 +429,72 @@ mod tests {
         ];
         let (claim, verdict) = solve_and_check_lra(&cons, 1_000_000);
         assert_eq!(claim, SolveResult::Sat);
-        assert!(verdict.is_accept(), "kernel should Accept the Simplex model");
+        assert!(
+            verdict.is_accept(),
+            "kernel should Accept the Simplex model"
+        );
+    }
+
+    #[test]
+    fn bv_unsat_certified() {
+        use tpt_solver_core::bv::{BvAssertion, BvTerm};
+        // x ^ ~x == 0 at width 4 is unsatisfiable.
+        let x = BvTerm::var(0, 4).unwrap();
+        let taut = BvTerm::xor(x.clone(), BvTerm::not(x).unwrap()).unwrap();
+        let zero = BvTerm::constant(4, 0).unwrap();
+        let asserts = vec![BvAssertion::Eq(taut, zero)];
+        let (claim, verdict) = solve_and_check_bv(1, &asserts, 1_000_000);
+        assert_eq!(claim, SolveResult::Unsat);
+        assert!(
+            verdict.is_accept(),
+            "kernel should Accept the LRAT proof over the blast"
+        );
+    }
+
+    #[test]
+    fn bv_sat_certified() {
+        use tpt_solver_core::bv::{BvAssertion, BvTerm};
+        // x + 1 == 0 at width 4 forces x = 15.
+        let t = BvTerm::add(BvTerm::var(0, 4).unwrap(), BvTerm::constant(4, 1).unwrap()).unwrap();
+        let zero = BvTerm::constant(4, 0).unwrap();
+        let asserts = vec![BvAssertion::Eq(t, zero)];
+        let (claim, verdict) = solve_and_check_bv(1, &asserts, 1_000_000);
+        assert_eq!(claim, SolveResult::Sat);
+        assert!(
+            verdict.is_accept(),
+            "kernel should Accept the decoded BV model"
+        );
+    }
+
+    #[test]
+    fn array_unsat_certified() {
+        use tpt_solver_core::array::{ArrAssertion, ArrayExpr, ElemExpr};
+        let sel = ElemExpr::select(
+            ArrayExpr::store(ArrayExpr::avar(0), ElemExpr::var(0), ElemExpr::konst(5)),
+            ElemExpr::var(0),
+        );
+        let asserts = vec![ArrAssertion::ElemsEqual(sel, ElemExpr::konst(7))];
+        let (claim, verdict) = solve_and_check_arrays(1, 1, &asserts, 100_000);
+        assert_eq!(claim, SolveResult::Unsat);
+        assert!(
+            verdict.is_accept(),
+            "kernel should Accept the axiom-instance certificate"
+        );
+    }
+
+    #[test]
+    fn array_sat_certified() {
+        use tpt_solver_core::array::{ArrAssertion, ArrayExpr, ElemExpr};
+        let sel = ElemExpr::select(
+            ArrayExpr::store(ArrayExpr::avar(0), ElemExpr::konst(3), ElemExpr::konst(9)),
+            ElemExpr::konst(3),
+        );
+        let asserts = vec![ArrAssertion::ElemsEqual(sel, ElemExpr::konst(9))];
+        let (claim, verdict) = solve_and_check_arrays(1, 0, &asserts, 100_000);
+        assert_eq!(claim, SolveResult::Sat);
+        assert!(
+            verdict.is_accept(),
+            "kernel should Accept the concrete array model"
+        );
     }
 }

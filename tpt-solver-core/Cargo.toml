@@ -14,6 +14,11 @@ description = "Untrusted but high-performance solving engine (CDCL, DPLL(T), Sim
 # Property-testing of the bounded linear-arithmetic invariants that `tpt-telos`
 # would target (fuel accounting, arena/trail offset math, literal packing).
 proptest = "1"
+# Reference oracle for differentially fuzzing the custom `i128`-backed `Rational`
+# (spec §4.2: a custom exact-rational is only permitted if it's differentially
+# fuzzed against a reference implementation as a dev-dependency-only oracle from
+# day one). Arbitrary-precision, so it can't silently share `Rational`'s own bugs.
+num-rational = "0.4"
 
 [features]
 default = ["std"]

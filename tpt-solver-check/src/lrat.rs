@@ -91,7 +91,12 @@ pub fn check_rup(database: &[Vec<Lit<()>>], derived: &[Lit<()>], var_count: u32)
     while changed {
         changed = false;
         for clause in database {
-            let mut unassigned: Option<usize> = None;
+            // The pending unit literal, if exactly one is unassigned so far: its
+            // variable index *and* the state that variable must take to satisfy
+            // this literal (`True` if the literal is positive, `False` if it's
+            // negated) — losing the polarity here and always assigning `True`
+            // would silently corrupt unit propagation for negative unit literals.
+            let mut unassigned: Option<(usize, LitState)> = None;
             let mut false_count = 0usize;
             for lit in clause {
                 let idx = lit.var().index();
@@ -119,7 +124,12 @@ pub fn check_rup(database: &[Vec<Lit<()>>], derived: &[Lit<()>], var_count: u32)
                             unassigned = None;
                             break;
                         }
-                        unassigned = Some(idx);
+                        let desired = if lit.is_positive() {
+                            LitState::True
+                        } else {
+                            LitState::False
+                        };
+                        unassigned = Some((idx, desired));
                     }
                 }
             }
@@ -127,9 +137,9 @@ pub fn check_rup(database: &[Vec<Lit<()>>], derived: &[Lit<()>], var_count: u32)
                 // All literals false -> conflict. The RUP clause is derivable.
                 return Outcome::Accept;
             }
-            if let Some(idx) = unassigned {
+            if let Some((idx, desired)) = unassigned {
                 if state[idx] == LitState::Unassigned {
-                    state[idx] = LitState::True;
+                    state[idx] = desired;
                     changed = true;
                 }
             }
@@ -183,6 +193,34 @@ mod tests {
         // (x1) (!x1) -> deriving empty clause is RUP.
         let db = vec![vec![Lit::new(var(1), true)], vec![Lit::new(var(1), false)]];
         assert_eq!(check_rup(&db, &[], 1), Outcome::Accept);
+    }
+
+    #[test]
+    fn negative_unit_clause_alone_is_satisfiable_not_rup_empty() {
+        // (!x1) alone is satisfiable (x1 = false); it must NOT let the checker
+        // derive the empty clause (which would falsely certify UNSAT).
+        let db = vec![vec![Lit::new(var(1), false)]];
+        assert_eq!(check_rup(&db, &[], 1), Outcome::Reject);
+    }
+
+    #[test]
+    fn chained_propagation_respects_polarity() {
+        // x1, (!x1 or x2), (!x2 or !x3): the only models have x3 = false.
+        let db = vec![
+            vec![Lit::new(var(1), true)],
+            vec![Lit::new(var(1), false), Lit::new(var(2), true)],
+            vec![Lit::new(var(2), false), Lit::new(var(3), false)],
+        ];
+        // (x3) is NOT entailed (x1=T,x2=T,x3=F is a model of the database).
+        assert_eq!(
+            check_rup(&db, &[Lit::new(var(3), true)], 3),
+            Outcome::Reject
+        );
+        // (!x3) IS entailed.
+        assert_eq!(
+            check_rup(&db, &[Lit::new(var(3), false)], 3),
+            Outcome::Accept
+        );
     }
 
     #[test]

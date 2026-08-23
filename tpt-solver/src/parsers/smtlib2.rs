@@ -29,6 +29,9 @@ use crate::reference::Problem;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use tpt_solver_core::array::{ArrAssertion, ArrayExpr, ElemExpr};
+use tpt_solver_core::bv::BvAssertion;
+use tpt_solver_core::bv::BvTerm;
 use tpt_solver_core::lra::LinConstraint;
 use tpt_solver_core::rational::Rational;
 
@@ -155,7 +158,7 @@ fn parse_sexps(toks: &[Tok], pos: &mut usize) -> Result<Vec<Sexp>, SmtError> {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Op {
+pub(crate) enum Op {
     And,
     Or,
     Not,
@@ -172,15 +175,46 @@ enum Op {
     Sub,
     Mul,
     Div,
+    // Bit-vector operators (QF_BV subset; see `Script::to_bv`).
+    BvNot,
+    BvNeg,
+    BvAnd,
+    BvOr,
+    BvXor,
+    BvAdd,
+    BvSub,
+    /// Logical left shift; the amount must be a constant literal.
+    BvShl,
+    /// Logical right shift; the amount must be a constant literal.
+    BvLShr,
+    /// Unsigned less-than.
+    BvUlt,
+    Concat,
+    Select,
+    Store,
     Other,
 }
 
+/// An extraction with its inclusive bit range `hi..=lo`, from the indexed
+/// operator form `((_ extract i j) t)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExtractRange {
+    pub hi: u32,
+    pub lo: u32,
+}
+
 #[derive(Debug, Clone)]
-enum Term {
+pub(crate) enum Term {
     Bool(bool),
     Num(Rational),
+    /// A bit-vector constant with its width (from `#x..` / `#b..` literals).
+    BvLit(u64, u8),
     Sym(String),
     App(Op, Vec<Term>),
+    /// `((_ extract hi lo) t)` — carries the bit range Op cannot.
+    Extract(ExtractRange, Box<Term>),
+    /// `((as const (Array S T)) v)` — the all-`v` constant array.
+    ConstArray(Box<Term>),
 }
 
 fn op_from_str(s: &str) -> Option<Op> {
@@ -201,6 +235,19 @@ fn op_from_str(s: &str) -> Option<Op> {
         "-" => Op::Sub,
         "*" => Op::Mul,
         "/" => Op::Div,
+        "bvnot" => Op::BvNot,
+        "bvneg" => Op::BvNeg,
+        "bvand" => Op::BvAnd,
+        "bvor" => Op::BvOr,
+        "bvxor" => Op::BvXor,
+        "bvadd" => Op::BvAdd,
+        "bvsub" => Op::BvSub,
+        "bvshl" => Op::BvShl,
+        "bvlshr" => Op::BvLShr,
+        "bvult" => Op::BvUlt,
+        "concat" => Op::Concat,
+        "select" => Op::Select,
+        "store" => Op::Store,
         _ => return None,
     })
 }
@@ -211,6 +258,61 @@ fn sexp_to_term(s: &Sexp) -> Result<Term, SmtError> {
         Sexp::List(items) => {
             if items.is_empty() {
                 return Err(SmtError::Parse("empty application ()".into()));
+            }
+            // Indexed / qualified operator forms, whose head is itself a list:
+            //   ((_ extract hi lo) t)      — bit-range extraction
+            //   ((as const (Array S T)) v) — a constant array
+            if let Sexp::List(head) = &items[0] {
+                if let Some(Sexp::Atom(tag)) = head.first() {
+                    match tag.as_str() {
+                        "_" => {
+                            if let Some(Sexp::Atom(kind)) = head.get(1) {
+                                if kind == "extract" {
+                                    let hi = parse_index(head.get(2), 2)?;
+                                    let lo = parse_index(head.get(3), 3)?;
+                                    if items.len() != 2 {
+                                        return Err(SmtError::BadArity(
+                                            "extract expects exactly 1 argument".into(),
+                                        ));
+                                    }
+                                    let arg = sexp_to_term(&items[1])?;
+                                    return Ok(Term::Extract(
+                                        ExtractRange { hi, lo },
+                                        Box::new(arg),
+                                    ));
+                                }
+                            }
+                            return Err(SmtError::Unsupported(format!(
+                                "unknown indexed operator {:?}",
+                                head
+                            )));
+                        }
+                        "as" => {
+                            // ((as const (Array S T)) v): a constant array.
+                            let is_const_array = matches!(head.get(1), Some(Sexp::Atom(a)) if a == "const");
+                            if is_const_array {
+                                if items.len() != 2 {
+                                    return Err(SmtError::BadArity(
+                                        "const array expects exactly 1 value".into(),
+                                    ));
+                                }
+                                let v = sexp_to_term(&items[1])?;
+                                return Ok(Term::ConstArray(Box::new(v)));
+                            }
+                            return Err(SmtError::Unsupported(format!(
+                                "unknown qualified symbol {:?}",
+                                head
+                            )));
+                        }
+                        _ => {
+                            return Err(SmtError::Unsupported(format!(
+                                "unknown application head {:?}",
+                                head
+                            )))
+                        }
+                    }
+                }
+                return Err(SmtError::Parse("application head is not a symbol".into()));
             }
             if let Sexp::Atom(head) = &items[0] {
                 if let Some(op) = op_from_str(head) {
@@ -237,6 +339,9 @@ fn atom_to_term(a: &str) -> Term {
         "true" => Term::Bool(true),
         "false" => Term::Bool(false),
         _ => {
+            if let Some(lit) = parse_bv_literal(a) {
+                return lit;
+            }
             if is_numeral(a) {
                 match parse_rational(a) {
                     Some(r) => Term::Num(r),
@@ -246,6 +351,36 @@ fn atom_to_term(a: &str) -> Term {
                 Term::Sym(a.to_string())
             }
         }
+    }
+}
+
+/// Parse `#b0101` / `#xAB` bit-vector literals into `(value, width)`.
+/// Widths above 64 bits are out of subset (`None`, surfacing as an unknown
+/// symbol and later [`SmtError::Unsupported`]).
+fn parse_bv_literal(a: &str) -> Option<Term> {
+    let (val, width) = if let Some(hex) = a.strip_prefix("#x") {
+        if hex.is_empty() || hex.len() > 16 {
+            return None;
+        }
+        (u64::from_str_radix(hex, 16).ok()?, (hex.len() * 4) as u8)
+    } else if let Some(bin) = a.strip_prefix("#b") {
+        if bin.is_empty() || bin.len() > 64 {
+            return None;
+        }
+        (u64::from_str_radix(bin, 2).ok()?, bin.len() as u8)
+    } else {
+        return None;
+    };
+    Some(Term::BvLit(val, width))
+}
+
+/// Parse a non-negative decimal index used by indexed operators.
+fn parse_index(s: Option<&Sexp>, pos: usize) -> Result<u32, SmtError> {
+    match s {
+        Some(Sexp::Atom(a)) => a
+            .parse::<u32>()
+            .map_err(|_| SmtError::Parse(format!("bad index at position {}: {:?}", pos, a))),
+        _ => Err(SmtError::Parse(format!("missing index at position {}", pos))),
     }
 }
 
@@ -288,8 +423,7 @@ fn parse_rational(a: &str) -> Option<Rational> {
         }
         _ => (0, 1),
     };
-    let num = sign
-        .checked_mul(intval.checked_mul(scale)?.checked_add(fracval)?)?;
+    let num = sign.checked_mul(intval.checked_mul(scale)?.checked_add(fracval)?)?;
     Rational::new(num, scale)
 }
 
@@ -305,11 +439,43 @@ fn pow10(n: u32) -> Option<i128> {
 // Script
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Sort {
     Bool,
     Real,
     Int,
+    /// `(_ BitVec n)` with `n <= 64`.
+    BitVec(u32),
+    /// `(Array S T)` — element universe is the suite's `u64` regardless of S/T
+    /// (a documented limitation of the QF_AX subset).
+    Array,
+}
+
+fn parse_sort(s: &Sexp) -> Option<Sort> {
+    match s {
+        Sexp::Atom(a) => match a.as_str() {
+            "Bool" => Some(Sort::Bool),
+            "Real" => Some(Sort::Real),
+            "Int" => Some(Sort::Int),
+            _ => None,
+        },
+        Sexp::List(items) => {
+            // (_ BitVec n)
+            if matches!(items.first(), Some(Sexp::Atom(a)) if a == "_") {
+                if let (Some(Sexp::Atom(k)), Some(Sexp::Atom(w))) = (items.get(1), items.get(2)) {
+                    if k == "BitVec" {
+                        return w.parse::<u32>().ok().map(Sort::BitVec);
+                    }
+                }
+                return None;
+            }
+            // (Array S T)
+            if matches!(items.first(), Some(Sexp::Atom(a)) if a == "Array") && items.len() == 3 {
+                return Some(Sort::Array);
+            }
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -353,7 +519,11 @@ impl Script {
         let mut constraints = Vec::new();
         collect_constraints(&combined, &mut ctx, &mut constraints)?;
         // Pad every constraint to a uniform variable count.
-        let n = constraints.iter().map(|c| c.coeffs.len()).max().unwrap_or(0);
+        let n = constraints
+            .iter()
+            .map(|c| c.coeffs.len())
+            .max()
+            .unwrap_or(0);
         for c in &mut constraints {
             c.coeffs.resize(n, Rational::zero());
         }
@@ -369,17 +539,84 @@ impl Script {
     /// arithmetic comparison (use [`Script::to_lra`] for those).
     pub fn to_cnf(&self) -> Result<Problem, SmtError> {
         let combined = self.combined_asserts()?;
+        // E-graph preprocessing (spec §4.3, §7): simplify the Boolean formula via
+        // equality saturation before Tseitin encoding it. This is untrusted
+        // preprocessing like the rest of the pipeline; see `egraph` module docs for
+        // why that's safe and how it's checked.
+        let simplified = crate::egraph::simplify_boolean(&combined)?;
         let mut enc = Encoder::default();
         for d in &self.decls {
             if matches!(d.sort, Sort::Bool) {
                 enc.intern_bool(&d.name);
             }
         }
-        let root = enc.encode(&combined, true)?;
+        let root = enc.encode(&simplified, true)?;
         enc.add_clause(vec![root]);
         Ok(Problem {
             var_count: enc.next_var,
             clauses: enc.clauses,
+        })
+    }
+
+    /// Lower to a QF_BV problem: a conjunction of bit-vector equalities and
+    /// unsigned `<` over the fixed-width fragment the core's bit-blaster
+    /// supports.
+    ///
+    /// Returns [`SmtError::Unsupported`] for disjunctions, shifts by
+    /// non-constant amounts, widths above 64, or any term outside the
+    /// fragment.
+    pub fn to_bv(&self) -> Result<BvProblem, SmtError> {
+        let mut ctx = BvCtx::default();
+        for d in &self.decls {
+            if let Sort::BitVec(w) = d.sort {
+                if w == 0 || w > 64 {
+                    return Err(SmtError::Unsupported(format!(
+                        "bit-vector width {} out of the supported 1..=64",
+                        w
+                    )));
+                }
+                ctx.intern(&d.name, w as u8);
+            }
+        }
+        let combined = self.combined_asserts()?;
+        let mut assertions = Vec::new();
+        collect_bv_assertions(&combined, &mut ctx, &mut assertions)?;
+        Ok(BvProblem {
+            var_count: ctx.vars.len() as u32,
+            names: ctx.names(),
+            assertions,
+        })
+    }
+
+    /// Lower to a QF_AX problem: a conjunction of ground equalities between
+    /// element terms (`var`/const/`select`) and array terms
+    /// (`avar`/`store`/constant arrays).
+    ///
+    /// The element universe is non-negative 64-bit integers regardless of the
+    /// declared index/value sorts — a documented limitation of this subset.
+    pub fn to_array(&self) -> Result<ArrayProblem, SmtError> {
+        let mut ctx = AxParserCtx::default();
+        // Element variables first (dense ids in declaration order), then
+        // array variables.
+        for d in &self.decls {
+            if matches!(d.sort, Sort::Int | Sort::Real) {
+                ctx.intern_elem(&d.name);
+            }
+        }
+        for d in &self.decls {
+            if matches!(d.sort, Sort::Array) {
+                ctx.intern_arr(&d.name);
+            }
+        }
+        let combined = self.combined_asserts()?;
+        let mut assertions = Vec::new();
+        collect_ax_assertions(&combined, &mut ctx, &mut assertions)?;
+        Ok(ArrayProblem {
+            avar_count: ctx.avars.len() as u32,
+            evar_count: ctx.evars.len() as u32,
+            avars: ctx.avars,
+            evars: ctx.evars,
+            assertions,
         })
     }
 
@@ -388,10 +625,7 @@ impl Script {
         if self.asserts.is_empty() {
             return Err(SmtError::NoAsserts);
         }
-        Ok(Term::App(
-            Op::And,
-            self.asserts.iter().cloned().collect(),
-        ))
+        Ok(Term::App(Op::And, self.asserts.to_vec()))
     }
 }
 
@@ -457,9 +691,7 @@ fn collect_constraints(
             }
             negate_comparison(&args[0], ctx, out)
         }
-        Term::App(Op::Le, args) => {
-            mk_cmp(args, ctx, out, CmpDir::Le)
-        }
+        Term::App(Op::Le, args) => mk_cmp(args, ctx, out, CmpDir::Le),
         Term::App(Op::Lt, args) => {
             // Strict inequality is approximated by its non-strict form.
             mk_cmp(args, ctx, out, CmpDir::Le)
@@ -516,7 +748,11 @@ fn mk_cmp(
     Ok(())
 }
 
-fn negate_comparison(term: &Term, ctx: &mut LraCtx, out: &mut Vec<LinConstraint>) -> Result<(), SmtError> {
+fn negate_comparison(
+    term: &Term,
+    ctx: &mut LraCtx,
+    out: &mut Vec<LinConstraint>,
+) -> Result<(), SmtError> {
     // not(a R b) where R in {<=,<,>=,>}. With the strict->non-strict approximation:
     //   not(a <= b) = a > b  =>  b <= a
     //   not(a >= b) = a < b  =>  a <= b
@@ -611,9 +847,10 @@ fn linear(term: &Term, ctx: &mut LraCtx) -> Result<Linear, SmtError> {
                         .map(|c| c.mul(*r))
                         .collect::<Option<Vec<_>>>()
                         .ok_or_else(|| SmtError::BadNumber("multiplication overflow".into()))?;
-                    let constant = l.constant.mul(*r).ok_or_else(|| {
-                        SmtError::BadNumber("multiplication overflow".into())
-                    })?;
+                    let constant = l
+                        .constant
+                        .mul(*r)
+                        .ok_or_else(|| SmtError::BadNumber("multiplication overflow".into()))?;
                     Ok(Linear { coeffs, constant })
                 }
                 _ => Err(SmtError::Unsupported(
@@ -854,8 +1091,11 @@ impl Encoder {
                     "arithmetic comparison in a boolean formula; use the LRA path".into(),
                 ))
             }
-            Term::App(Op::Other, _) | Term::App(Op::Add, _) | Term::App(Op::Sub, _)
-            | Term::App(Op::Mul, _) | Term::App(Op::Div, _) => {
+            Term::App(Op::Other, _)
+            | Term::App(Op::Add, _)
+            | Term::App(Op::Sub, _)
+            | Term::App(Op::Mul, _)
+            | Term::App(Op::Div, _) => {
                 return Err(SmtError::Unsupported(
                     "non-boolean term in a boolean formula".into(),
                 ))
@@ -925,17 +1165,189 @@ fn parse_decl(head: &str, items: &[Sexp]) -> Option<Decl> {
         items.get(2)
     } else {
         items.get(3)
-    };
-    let sort = match sort_sexp {
-        Some(Sexp::Atom(s)) => match s.as_str() {
-            "Bool" => Sort::Bool,
-            "Real" => Sort::Real,
-            "Int" => Sort::Int,
-            _ => Sort::Real,
-        },
-        _ => return None,
-    };
+    }?;
+    let sort = parse_sort(sort_sexp)?;
     Some(Decl { name, sort })
+}
+
+// ---------------------------------------------------------------------------
+// Bit-vector lowering (QF_BV subset)
+// ---------------------------------------------------------------------------
+
+/// A lowered QF_BV problem, ready for the core's bit-blasting engine.
+#[derive(Debug, Clone)]
+pub struct BvProblem {
+    /// Number of bit-vector variables; ids are dense in `0..var_count`.
+    pub var_count: u32,
+    /// Variable names by id (for model display).
+    pub names: Vec<String>,
+    /// The conjunction of asserted comparisons.
+    pub assertions: Vec<BvAssertion>,
+}
+
+#[derive(Default)]
+struct BvCtx {
+    names: Vec<String>,
+    idx: HashMap<String, (u32, u8)>,
+}
+
+impl BvCtx {
+    fn intern(&mut self, name: &str, width: u8) {
+        if !self.idx.contains_key(name) {
+            let id = self.names.len() as u32;
+            self.names.push(name.to_string());
+            self.idx.insert(name.to_string(), (id, width));
+        }
+    }
+
+    fn lookup(&self, name: &str) -> Option<(u32, u8)> {
+        self.idx.get(name).copied()
+    }
+}
+
+fn collect_bv_assertions(
+    term: &Term,
+    ctx: &mut BvCtx,
+    out: &mut Vec<BvAssertion>,
+) -> Result<(), SmtError> {
+    match term {
+        Term::App(Op::And, args) => {
+            for a in args {
+                collect_bv_assertions(a, ctx, out)?;
+            }
+            Ok(())
+        }
+        Term::Bool(true) => Ok(()),
+        Term::App(Op::Eq, args) => {
+            if args.len() != 2 {
+                return Err(SmtError::BadArity("equality expects 2 arguments".into()));
+            }
+            let l = bv_term(&args[0], ctx)?;
+            let r = bv_term(&args[1], ctx)?;
+            BvAssertion::eq(l, r).ok_or_else(|| {
+                SmtError::Unsupported("bit-vector equality width mismatch".into())
+            })
+        }
+        Term::App(Op::BvUlt, args) => {
+            if args.len() != 2 {
+                return Err(SmtError::BadArity("bvult expects 2 arguments".into()));
+            }
+            let l = bv_term(&args[0], ctx)?;
+            let r = bv_term(&args[1], ctx)?;
+            BvAssertion::ult(l, r).ok_or_else(|| {
+                SmtError::Unsupported("bit-vector comparison width mismatch".into())
+            })
+        }
+        _ => Err(SmtError::Unsupported(
+            "QF_BV lowering supports only conjunctions of = and bvult".into(),
+        )),
+    }
+}
+
+/// Lower a bit-vector term. Shifts must be by constant `#x`/`#b` literals.
+fn bv_term(term: &Term, ctx: &BvCtx) -> Result<BvTerm, SmtError> {
+    let width_mismatch = || SmtError::Unsupported("bit-vector width mismatch".into());
+    match term {
+        Term::BvLit(v, w) => BvTerm::constant(*w, *v)
+            .ok_or_else(|| SmtError::Unsupported("bit-vector width out of range".into())),
+        Term::Sym(name) => {
+            let (id, w) = ctx.lookup(name).ok_or_else(|| {
+                SmtError::Unsupported(format!("unknown bit-vector symbol {:?}", name))
+            })?;
+            BvTerm::var(id, w)
+                .ok_or_else(|| SmtError::Unsupported("bit-vector width out of range".into()))
+        }
+        Term::Extract(range, arg) => {
+            let a = bv_term(arg, ctx)?;
+            let hi = u8::try_from(range.hi)
+                .ok()
+                .filter(|&h| h < 64)
+                .ok_or_else(|| SmtError::Unsupported("extract index out of range".into()))?;
+            let lo = u8::try_from(range.lo)
+                .ok()
+                .filter(|&l| l <= hi)
+                .ok_or_else(|| SmtError::Unsupported("extract index out of range".into()))?;
+            BvTerm::extract(a, hi, lo)
+                .ok_or_else(|| SmtError::Unsupported("extract range outside operand".into()))
+        }
+        Term::App(op, args) => {
+            let need = |n: usize| -> Result<(), SmtError> {
+                if args.len() != n {
+                    Err(SmtError::BadArity(format!(
+                        "operator expects {} arguments",
+                        n
+                    )))
+                } else {
+                    Ok(())
+                }
+            };
+            let a0 = || bv_term(&args[0], ctx);
+            let a1 = || bv_term(&args[1], ctx);
+            match op {
+                Op::BvNot => {
+                    need(1)?;
+                    BvTerm::not(a0()?).ok_or_else(width_mismatch)
+                }
+                Op::BvNeg => {
+                    need(1)?;
+                    BvTerm::neg(a0()?).ok_or_else(width_mismatch)
+                }
+                Op::BvAdd => {
+                    need(2)?;
+                    BvTerm::add(a0()?, a1()?).ok_or_else(width_mismatch)
+                }
+                Op::BvSub => {
+                    need(2)?;
+                    BvTerm::sub(a0()?, a1()?).ok_or_else(width_mismatch)
+                }
+                Op::BvAnd => {
+                    need(2)?;
+                    BvTerm::and(a0()?, a1()?).ok_or_else(width_mismatch)
+                }
+                Op::BvOr => {
+                    need(2)?;
+                    BvTerm::or(a0()?, a1()?).ok_or_else(width_mismatch)
+                }
+                Op::BvXor => {
+                    need(2)?;
+                    BvTerm::xor(a0()?, a1()?).ok_or_else(width_mismatch)
+                }
+                Op::Concat => {
+                    need(2)?;
+                    BvTerm::concat(a0()?, a1()?)
+                        .ok_or_else(|| SmtError::Unsupported("concatenation exceeds 64 bits".into()))
+                }
+                Op::BvShl | Op::BvLShr => {
+                    need(2)?;
+                    let amt = match &args[1] {
+                        // Amounts >= any width collapse to "yield 0", so 64 is
+                        // a faithful saturation point for widths <= 64.
+                        Term::BvLit(v, _) => Some(v.min(64) as u8),
+                        _ => None,
+                    }
+                    .ok_or_else(|| {
+                        SmtError::Unsupported(
+                            "shifts must be by a constant #x/#b literal".into(),
+                        )
+                    })?;
+                    let arg = a0()?;
+                    if *op == Op::BvShl {
+                        BvTerm::shl(arg, amt)
+                    } else {
+                        BvTerm::lshr(arg, amt)
+                    }
+                    .ok_or_else(width_mismatch)
+                }
+                _ => Err(SmtError::Unsupported(format!(
+                    "operator not supported in the QF_BV subset: {:?}",
+                    op
+                ))),
+            }
+        }
+        _ => Err(SmtError::Unsupported(
+            "term is not a bit-vector expression".into(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -974,8 +1386,7 @@ mod tests {
 ";
         let script = parse_script(src).unwrap();
         let prob = script.to_lra().unwrap();
-        let (claim, verdict) =
-            crate::reference::solve_and_check_lra(&prob.constraints, 1_000_000);
+        let (claim, verdict) = crate::reference::solve_and_check_lra(&prob.constraints, 1_000_000);
         assert_eq!(claim, tpt_solver_core::engine::SolveResult::Sat);
         assert!(verdict.is_accept());
     }
@@ -994,8 +1405,7 @@ mod tests {
         let prob = script.to_cnf().unwrap();
         assert!(prob.var_count >= 2);
         // Should be satisfiable (b true).
-        let (claim, verdict) =
-            crate::reference::solve_and_check_cdcl(&prob, 1_000_000);
+        let (claim, verdict) = crate::reference::solve_and_check_cdcl(&prob, 1_000_000);
         assert_eq!(claim, tpt_solver_core::engine::SolveResult::Sat);
         assert!(verdict.is_accept());
     }
@@ -1020,9 +1430,6 @@ mod tests {
 (check-sat)
 ";
         let script = parse_script(src).unwrap();
-        assert!(matches!(
-            script.to_lra(),
-            Err(SmtError::Unsupported(_))
-        ));
+        assert!(matches!(script.to_lra(), Err(SmtError::Unsupported(_))));
     }
 }

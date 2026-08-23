@@ -36,8 +36,10 @@ jobs:
       - name: Install Z3
         run: sudo apt-get update && sudo apt-get install -y z3
       - name: Differential tests vs Z3 oracle
-        # `differential_vs_z3_when_available` shells out to `z3`; with Z3 installed
-        # it compares tpt-solver's claims against a real external oracle.
+        # `differential_vs_z3_when_available` (QF_SAT) and
+        # `differential_lra_vs_z3_when_available` (QF_LRA) shell out to `z3`; with
+        # Z3 installed they compare tpt-solver's claims against a real external
+        # oracle.
         run: cargo test -p tpt-solver --lib differential:: --verbose
 
   kani:

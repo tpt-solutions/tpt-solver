@@ -25,6 +25,8 @@
 
 extern crate alloc;
 
+pub mod array;
+pub mod bv;
 pub mod engine;
 pub mod fuel;
 pub mod ir;

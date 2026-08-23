@@ -9,7 +9,9 @@
 //! parsers and CLI arrive in Phase 4; what exists now is the reference solver and the
 //! end-to-end integration path.
 
-pub mod differential;
+#[cfg(test)]
+mod differential;
+mod egraph;
 pub mod parsers;
 pub mod policy;
 pub mod reference;
