@@ -311,6 +311,16 @@ impl CdclSolver {
             // Most recent seen literal on the trail.
             loop {
                 if index == 0 {
+                    #[cfg(test)]
+                    println!(
+                        "UNDERFLOW pathc={} learnt={:?} seen={:?} lims={:?} trail={:?} lvl={}",
+                        path_c,
+                        learnt,
+                        seen,
+                        self.trail_lim,
+                        self.trail,
+                        self.decision_level()
+                    );
                     // Malformed reason chain; bail out (caller restarts at 0).
                     return (Vec::new(), 0);
                 }
@@ -321,13 +331,29 @@ impl CdclSolver {
                 }
             }
             seen[p.unsigned_abs() as usize] = false;
+            #[cfg(test)]
+            println!(
+                "PICK p={} idx={} pc={} reason={:?}",
+                p,
+                index,
+                path_c,
+                self.reason[(p.unsigned_abs() as usize) - 1]
+                    .map(|r| r)
+            );
             path_c -= 1;
             if path_c <= 0 {
                 break;
             }
             match self.reason[(p.unsigned_abs() as usize) - 1] {
                 Some(r) => conflict_clause = r,
-                None => break, // decision var mid-path: bail out
+                None => {
+                    #[cfg(test)]
+                    eprintln!(
+                        "BAILD p={} pathc={} learnt={:?} confl={:?}",
+                        p, path_c, learnt, self.clauses[conflict_clause].lits
+                    );
+                    break; // decision var mid-path: bail out
+                }
             }
         }
         learnt.insert(0, Self::negate(p));
@@ -577,11 +603,19 @@ impl CdclSolver {
                     }
                     let (learnt, btlevel) = self.analyze(c);
                     if learnt.is_empty() {
-                        // Malformed reason chain: honest backtrack to the
-                        // root without learning (fuel bounds the search).
+                        #[cfg(test)]
+                        eprintln!("BAIL at lvl={}", self.decision_level());
                         self.cancel_until(0);
                     } else {
                         self.cancel_until(btlevel);
+                        #[cfg(test)]
+                        eprintln!(
+                            "C{:06} lvl={} -> bt={} learnt={:?}",
+                            self.conflicts,
+                            self.decision_level(),
+                            btlevel,
+                            learnt
+                        );
                         if !self.add_learnt(&learnt) {
                             // The learnt clause is already falsified: a
                             // level-0 contradiction derived from the original

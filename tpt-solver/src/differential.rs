@@ -16,7 +16,10 @@
 //! oracle; it is a no-op where `z3` is absent so the suite stays green offline.
 
 use crate::policy::VerdictTracker;
-use crate::reference::{solve_and_check, solve_and_check_cdcl, solve_and_check_lra, Problem};
+use crate::reference::{
+    solve_and_check, solve_and_check_arrays, solve_and_check_bv, solve_and_check_cdcl,
+    solve_and_check_lra, Problem,
+};
 use std::process::Command;
 use tpt_solver_check::outcome::Outcome;
 use tpt_solver_core::engine::SolveResult;
@@ -312,5 +315,478 @@ fn differential_lra_vs_z3_when_available() {
             "checker did not Accept the LRA verdict vs Z3: {:?}",
             verdict
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bit-vector differential lane (QF_BV)
+// ---------------------------------------------------------------------------
+
+use tpt_solver_core::array::{ArrAssertion, ArrayExpr, ElemExpr};
+use tpt_solver_core::bv::{BvAssertion, BvBinOp, BvTerm};
+
+/// Serialize a core bit-vector term back to SMT-LIB2 syntax (`x{id}w{width}`
+/// variables).
+fn bv_term_to_smt2(t: &BvTerm) -> String {
+    match t {
+        BvTerm::Var { id, width } => format!("x{}w{}", id, width),
+        BvTerm::Const { width, value } => {
+            // Binary keeps the width exact (hex would round up to multiples
+            // of four and change the sort on re-parse).
+            format!("#b{:0wb$b}", value, wb = *width as usize)
+        }
+        BvTerm::Not { arg } => format!("(bvnot {})", bv_term_to_smt2(arg)),
+        BvTerm::Neg { arg } => format!("(bvneg {})", bv_term_to_smt2(arg)),
+        BvTerm::BinOp { op, lhs, rhs } => {
+            let name = match op {
+                BvBinOp::And => "bvand",
+                BvBinOp::Or => "bvor",
+                BvBinOp::Xor => "bvxor",
+                BvBinOp::Add => "bvadd",
+                _ => "bvsub",
+            };
+            format!(
+                "({} {} {})",
+                name,
+                bv_term_to_smt2(lhs),
+                bv_term_to_smt2(rhs)
+            )
+        }
+        BvTerm::Shift { left, arg, amount } => {
+            let w = arg.width();
+            let name = if *left { "bvshl" } else { "bvlshr" };
+            // Shift by a constant: emit an exactly-`w`-wide binary literal.
+            format!(
+                "({} {} #b{:0wb$b})",
+                name,
+                bv_term_to_smt2(arg),
+                *amount as u64,
+                wb = w as usize
+            )
+        }
+        BvTerm::Concat { hi, lo } => {
+            format!("(concat {} {})", bv_term_to_smt2(hi), bv_term_to_smt2(lo))
+        }
+        BvTerm::Extract { arg, hi, lo } => {
+            format!("((_ extract {} {}) {})", hi, lo, bv_term_to_smt2(arg))
+        }
+    }
+}
+
+/// Collect `(id, width)` pairs for every variable occurring in `t`.
+fn collect_bv_vars(t: &BvTerm, out: &mut Vec<(u32, u8)>) {
+    match t {
+        BvTerm::Var { id, width } => {
+            if !out.iter().any(|&(i, _)| i == *id) {
+                out.push((*id, *width));
+            }
+        }
+        BvTerm::Const { .. } => {}
+        BvTerm::Not { arg } | BvTerm::Neg { arg } => collect_bv_vars(arg, out),
+        BvTerm::BinOp { lhs, rhs, .. } => {
+            collect_bv_vars(lhs, out);
+            collect_bv_vars(rhs, out);
+        }
+        BvTerm::Shift { arg, .. } => collect_bv_vars(arg, out),
+        BvTerm::Concat { hi, lo } => {
+            collect_bv_vars(hi, out);
+            collect_bv_vars(lo, out);
+        }
+        BvTerm::Extract { arg, .. } => collect_bv_vars(arg, out),
+    }
+}
+
+/// Build a small random bit-vector term over the given variables.
+fn gen_bv_term(rng: &mut Lcg, vars: u32, width: u8, depth: u32) -> BvTerm {
+    if depth == 0 || rng.below(4) == 0 {
+        return BvTerm::var(rng.below(vars), width).expect("width 1..=64");
+    }
+    let mask = crate_mask(width);
+    match rng.below(6) {
+        0 => {
+            let inner = gen_bv_term(rng, vars, width, depth - 1);
+            BvTerm::not(inner).expect("well-formed")
+        }
+        1 => {
+            let k = rng.next() & mask;
+            BvTerm::constant(width, k).expect("well-formed")
+        }
+        2 | 3 => {
+            let op = match rng.below(5) {
+                0 => BvBinOp::And,
+                1 => BvBinOp::Or,
+                2 => BvBinOp::Xor,
+                3 => BvBinOp::Add,
+                _ => BvBinOp::Sub,
+            };
+            let l = gen_bv_term(rng, vars, width, depth - 1);
+            let r = gen_bv_term(rng, vars, width, depth - 1);
+            match op {
+                BvBinOp::And => BvTerm::and(l, r),
+                BvBinOp::Or => BvTerm::or(l, r),
+                BvBinOp::Xor => BvTerm::xor(l, r),
+                BvBinOp::Add => BvTerm::add(l, r),
+                BvBinOp::Sub => BvTerm::sub(l, r),
+            }
+            .expect("same-width operands")
+        }
+        4 => {
+            let inner = gen_bv_term(rng, vars, width, depth - 1);
+            let amt = rng.below((width as u32) + 1) as u8;
+            if rng.below(2) == 0 {
+                BvTerm::shl(inner, amt).expect("well-formed")
+            } else {
+                BvTerm::lshr(inner, amt).expect("well-formed")
+            }
+        }
+        _ => {
+            // Extract from a double-width concatenation, zero-padded back to
+            // the full width so the result stays usable as an operand.
+            let hi = gen_bv_term(rng, vars, width, depth - 1);
+            let lo = gen_bv_term(rng, vars, width, depth - 1);
+            let cat = BvTerm::concat(hi, lo).expect("2*w <= 64 for w <= 32");
+            let hi_i = rng.below(width as u32) as u8;
+            let lo_i = rng.below(hi_i as u32 + 1) as u8;
+            let slice = BvTerm::extract(cat, hi_i, lo_i).expect("in-range extract");
+            let hw = (hi_i - lo_i + 1) as u8;
+            if hw >= width {
+                slice
+            } else {
+                // Zero-extend back to `width`.
+                let pad = BvTerm::constant(width - hw, 0).expect("pad width 1..=64");
+                BvTerm::concat(pad, slice).expect("padded width == original")
+            }
+        }
+    }
+}
+
+fn crate_mask(w: u8) -> u64 {
+    if w >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << w) - 1
+    }
+}
+
+/// Differential testing of the QF_BV path against Z3. No-op without `z3`.
+#[test]
+fn differential_bv_vs_z3_when_available() {
+    if !z3_present() {
+        eprintln!("z3 not found on PATH; skipping Z3 BV differential test");
+        return;
+    }
+
+    let mut rng = Lcg(0x5eed_bee5);
+    for case in 0..40u32 {
+        let width = 1 + rng.below(3) as u8;
+        let vars = 1 + rng.below(2);
+        let t1 = gen_bv_term(&mut rng, vars, width, 2);
+        let t2 = gen_bv_term(&mut rng, vars, width, 2);
+
+        let mut decls: Vec<(u32, u8)> = Vec::new();
+        collect_bv_vars(&t1, &mut decls);
+        collect_bv_vars(&t2, &mut decls);
+
+        let assertion = if rng.below(2) == 0 {
+            BvAssertion::Eq(t1.clone(), t2.clone())
+        } else {
+            BvAssertion::Ult(t1.clone(), t2.clone())
+        };
+
+        let mut smt2 = String::from("(set-logic QF_BV)\n");
+        for &(id, w) in &decls {
+            smt2.push_str(&format!(
+                "(declare-fun x{}w{} () (_ BitVec {}))\n",
+                id, w, w
+            ));
+        }
+        smt2.push_str(&bv_assertion_to_smt2(&assertion));
+        smt2.push_str("(check-sat)\n");
+
+        let z3_claim = match run_z3(&smt2) {
+            Some(c) => c,
+            None => continue,
+        };
+        let assertions = [assertion];
+        let (claim, verdict) = solve_and_check_bv(vars, &assertions, 10_000_000);
+        assert_eq!(
+            claim, z3_claim,
+            "disagreement with Z3 on BV problem (case {}):\n{}",
+            case, smt2
+        );
+        assert!(
+            verdict.is_accept(),
+            "checker did not Accept the BV verdict vs Z3: {:?}",
+            verdict
+        );
+    }
+}
+
+fn bv_assertion_to_smt2(a: &BvAssertion) -> String {
+    let (l, r, op) = match a {
+        BvAssertion::Eq(l, r) => (l, r, "="),
+        BvAssertion::Ult(l, r) => (l, r, "bvult"),
+    };
+    format!(
+        "(assert ({} {} {}))\n",
+        op,
+        bv_term_to_smt2(l),
+        bv_term_to_smt2(r)
+    )
+}
+
+/// Offline guard for the Z3 serialization: the emitted QF_BV scripts must be
+/// accepted by our *own* SMT-LIB2 parser/lowering, and solving the round-tripped
+/// problem must agree with solving the original assertions.
+#[test]
+fn bv_z3_serialization_roundtrips_through_own_parser() {
+    let mut rng = Lcg(0xfeed_face);
+    for case in 0..25u32 {
+        let width = 1 + rng.below(3) as u8;
+        let vars = 1 + rng.below(2);
+        let t1 = gen_bv_term(&mut rng, vars, width, 2);
+        let t2 = gen_bv_term(&mut rng, vars, width, 2);
+
+        let mut decls: Vec<(u32, u8)> = Vec::new();
+        collect_bv_vars(&t1, &mut decls);
+        collect_bv_vars(&t2, &mut decls);
+
+        let assertion = if rng.below(2) == 0 {
+            BvAssertion::Eq(t1.clone(), t2.clone())
+        } else {
+            BvAssertion::Ult(t1.clone(), t2.clone())
+        };
+
+        let mut smt2 = String::from("(set-logic QF_BV)\n");
+        for &(id, w) in &decls {
+            smt2.push_str(&format!(
+                "(declare-fun x{}w{} () (_ BitVec {}))\n",
+                id, w, w
+            ));
+        }
+        smt2.push_str(&bv_assertion_to_smt2(&assertion));
+        smt2.push_str("(check-sat)\n");
+
+        let script = crate::parsers::smtlib2::parse_script(&smt2)
+            .unwrap_or_else(|e| panic!("case {}: own parser rejected its own script: {}", case, e));
+        let prob = script.to_bv().unwrap_or_else(|e| {
+            panic!("case {}: own lowering rejected its own script: {}", case, e)
+        });
+        // Only *occurring* variables are declared, so the round-tripped count
+        // matches the declaration list, not necessarily the full var space.
+        assert_eq!(prob.var_count, decls.len() as u32);
+
+        let assertions = [assertion];
+        let (direct, dv) = solve_and_check_bv(vars, &assertions, 10_000_000);
+        let (rt, rv) = solve_and_check_bv(prob.var_count, &prob.assertions, 10_000_000);
+        assert_eq!(direct, rt, "round-trip changed the verdict (case {})", case);
+        if direct == SolveResult::Unknown {
+            // The engine is complete on this fragment: an Unknown here is a
+            // bug worth capturing verbatim for debugging.
+            panic!(
+                "case {}: engine gave up\ndirect verdict={:?}\n{}",
+                case, dv, smt2
+            );
+        }
+        assert!(
+            dv.is_accept(),
+            "case {}: checker did not Accept the direct verdict\n{:?}",
+            case,
+            smt2
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Array differential lane (QF_AX)
+// ---------------------------------------------------------------------------
+
+/// Serialize an element term (`e{id}` element vars, `a{id}` array vars).
+fn ax_elem_to_smt2(e: &ElemExpr) -> String {
+    match e {
+        ElemExpr::Var(id) => format!("e{}", id),
+        ElemExpr::Const(v) => v.to_string(),
+        ElemExpr::Select(arr, idx) => {
+            format!("(select {} {})", ax_arr_to_smt2(arr), ax_elem_to_smt2(idx))
+        }
+    }
+}
+
+fn ax_arr_to_smt2(a: &ArrayExpr) -> String {
+    match a {
+        ArrayExpr::AVar(id) => format!("a{}", id),
+        ArrayExpr::ConstArray(v) => {
+            format!("((as const (Array Int Int)) {})", ax_elem_to_smt2(v))
+        }
+        ArrayExpr::Store(base, idx, val) => format!(
+            "(store {} {} {})",
+            ax_arr_to_smt2(base),
+            ax_elem_to_smt2(idx),
+            ax_elem_to_smt2(val)
+        ),
+    }
+}
+
+/// Build a small random element expression over `navars` arrays and `nevars`
+/// element variables with values/indices in `{0,1,2}`.
+fn gen_ax_elem(rng: &mut Lcg, navars: u32, nevars: u32, depth: u32) -> ElemExpr {
+    if depth == 0 || rng.below(3) == 0 {
+        return match rng.below(2) {
+            0 => ElemExpr::Const(rng.below(3) as u64),
+            _ => ElemExpr::Var(rng.below(nevars)),
+        };
+    }
+    let arr = gen_ax_arr(rng, navars, nevars, depth - 1);
+    let idx = gen_ax_elem(rng, navars, nevars, depth - 1);
+    ElemExpr::select(arr, idx)
+}
+
+fn gen_ax_arr(rng: &mut Lcg, navars: u32, nevars: u32, depth: u32) -> ArrayExpr {
+    if depth == 0 || rng.below(3) == 0 {
+        return ArrayExpr::AVar(rng.below(navars));
+    }
+    let base = gen_ax_arr(rng, navars, nevars, depth - 1);
+    let idx = gen_ax_elem(rng, navars, nevars, depth - 1);
+    let val = gen_ax_elem(rng, navars, nevars, depth - 1);
+    ArrayExpr::store(base, idx, val)
+}
+
+/// Differential testing of the QF_AX path against Z3. No-op without `z3`.
+#[test]
+fn differential_array_vs_z3_when_available() {
+    if !z3_present() {
+        eprintln!("z3 not found on PATH; skipping Z3 array differential test");
+        return;
+    }
+
+    let mut rng = Lcg(0x0a11_ace5);
+    for case in 0..40u32 {
+        let navars = 1 + rng.below(2);
+        let nevars = 1 + rng.below(2);
+
+        // Two random element equalities plus one array equality per instance.
+        let el = gen_ax_elem(&mut rng, navars, nevars, 2);
+        let er = gen_ax_elem(&mut rng, navars, nevars, 2);
+        let al = gen_ax_arr(&mut rng, navars, nevars, 2);
+        let ar = gen_ax_arr(&mut rng, navars, nevars, 2);
+        let assertions = vec![
+            ArrAssertion::ElemsEqual(el.clone(), er.clone()),
+            ArrAssertion::ArraysEqual(al.clone(), ar.clone()),
+        ];
+
+        let mut smt2 = String::from("(set-logic QF_AX)\n");
+        for i in 0..nevars {
+            smt2.push_str(&format!("(declare-fun e{} () Int)\n", i));
+        }
+        for i in 0..navars {
+            smt2.push_str(&format!("(declare-fun a{} () (Array Int Int))\n", i));
+        }
+        for a in &assertions {
+            match a {
+                ArrAssertion::ElemsEqual(l, r) => {
+                    smt2.push_str(&format!(
+                        "(assert (= {} {}))\n",
+                        ax_elem_to_smt2(l),
+                        ax_elem_to_smt2(r)
+                    ));
+                }
+                ArrAssertion::ArraysEqual(l, r) => {
+                    smt2.push_str(&format!(
+                        "(assert (= {} {}))\n",
+                        ax_arr_to_smt2(l),
+                        ax_arr_to_smt2(r)
+                    ));
+                }
+            }
+        }
+        smt2.push_str("(check-sat)\n");
+
+        let z3_claim = match run_z3(&smt2) {
+            Some(c) => c,
+            None => continue,
+        };
+        let (claim, verdict) = solve_and_check_arrays(navars, nevars, &assertions, 200_000);
+        assert_eq!(
+            claim, z3_claim,
+            "disagreement with Z3 on AX problem (case {}):\n{}",
+            case, smt2
+        );
+        if claim != SolveResult::Unknown {
+            assert!(
+                verdict.is_accept(),
+                "checker did not Accept the AX verdict vs Z3: {:?}",
+                verdict
+            );
+        }
+    }
+}
+
+/// Offline guard for the QF_AX serialization: emitted scripts must round-trip
+/// through our own parser/lowering with identical verdicts.
+#[test]
+fn ax_z3_serialization_roundtrips_through_own_parser() {
+    let mut rng = Lcg(0xdec0_ded0);
+    for case in 0..25u32 {
+        let navars = 1 + rng.below(2);
+        let nevars = 1 + rng.below(2);
+
+        let el = gen_ax_elem(&mut rng, navars, nevars, 2);
+        let er = gen_ax_elem(&mut rng, navars, nevars, 2);
+        let al = gen_ax_arr(&mut rng, navars, nevars, 2);
+        let ar = gen_ax_arr(&mut rng, navars, nevars, 2);
+        let assertions = vec![
+            ArrAssertion::ElemsEqual(el.clone(), er.clone()),
+            ArrAssertion::ArraysEqual(al.clone(), ar.clone()),
+        ];
+
+        let mut smt2 = String::from("(set-logic QF_AX)\n");
+        for i in 0..nevars {
+            smt2.push_str(&format!("(declare-fun e{} () Int)\n", i));
+        }
+        for i in 0..navars {
+            smt2.push_str(&format!("(declare-fun a{} () (Array Int Int))\n", i));
+        }
+        for a in &assertions {
+            match a {
+                ArrAssertion::ElemsEqual(l, r) => {
+                    smt2.push_str(&format!(
+                        "(assert (= {} {}))\n",
+                        ax_elem_to_smt2(l),
+                        ax_elem_to_smt2(r)
+                    ));
+                }
+                ArrAssertion::ArraysEqual(l, r) => {
+                    smt2.push_str(&format!(
+                        "(assert (= {} {}))\n",
+                        ax_arr_to_smt2(l),
+                        ax_arr_to_smt2(r)
+                    ));
+                }
+            }
+        }
+        smt2.push_str("(check-sat)\n");
+
+        let script = crate::parsers::smtlib2::parse_script(&smt2)
+            .unwrap_or_else(|e| panic!("case {}: own parser rejected its own script: {}", case, e));
+        let prob = script.to_array().unwrap_or_else(|e| {
+            panic!("case {}: own lowering rejected its own script: {}", case, e)
+        });
+        assert_eq!(prob.avars.len() as u32, navars);
+        assert_eq!(prob.evars.len() as u32, nevars);
+
+        let (direct, dv) = solve_and_check_arrays(navars, nevars, &assertions, 200_000);
+        let (rt, rv) = solve_and_check_arrays(
+            prob.avars.len() as u32,
+            prob.evars.len() as u32,
+            &prob.assertions,
+            200_000,
+        );
+        assert_eq!(direct, rt, "round-trip changed the verdict (case {})", case);
+        // The engine may honestly return Unknown on hard random instances;
+        // any decided answer must be kernel-Accepted.
+        if direct != SolveResult::Unknown {
+            assert!(dv.is_accept());
+            assert!(rv.is_accept(), "round-tripped model was not accepted");
+        }
     }
 }

@@ -837,6 +837,38 @@ mod tests {
     }
 
     #[test]
+    fn tmp_and_bug_debug() {
+        // x1 <u (x0|x1) & (x1&x0): RHS == x0&x1 <= x1 always => UNSAT.
+        let x0 = v(0, 3);
+        let x1 = v(1, 3);
+        let or_t = BvTerm::or(x0.clone(), x1.clone()).unwrap();
+        let and_t = BvTerm::and(x1.clone(), x0.clone()).unwrap();
+        let rhs = BvTerm::and(or_t, and_t).unwrap();
+        let asserts = vec![BvAssertion::ult(x1.clone(), rhs).unwrap()];
+        // Brute-force truth:
+        let mut any = false;
+        for a in 0..8u64 {
+            for b in 0..8u64 {
+                if let Some(true) = assertion_holds(&asserts[0], &[a, b]) {
+                    any = true;
+                }
+            }
+        }
+        println!("brute force satisfiable = {}", any);
+        // Escalating fuels to distinguish exhaustion from an immediate Unknown.
+        let blasted = blast_bv(2, &asserts).expect("blast");
+        for f in [600u64] {
+            let ans = crate::sat::solve_cnf(blasted.var_count, &blasted.clauses, f);
+            println!("fuel={:>9} -> {:?}", f, ans.result);
+        }
+        match solve_bv(2, &asserts, 10_000_000) {
+            Some(BvOutcome::Unsat(_)) => println!("engine UNSAT (correct)"),
+            Some(BvOutcome::Sat(m)) => println!("engine SAT model={:?} (BUG)", m.values),
+            None => println!("engine gave up (BUG?)"),
+        }
+    }
+
+    #[test]
     fn constructor_width_validation() {
         assert!(BvTerm::var(0, 0).is_none());
         assert!(BvTerm::var(0, 65).is_none());

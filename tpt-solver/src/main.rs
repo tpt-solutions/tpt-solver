@@ -17,7 +17,10 @@
 use tpt_solver::parsers::dimacs::parse_dimacs;
 use tpt_solver::parsers::mps::parse_mps;
 use tpt_solver::parsers::smtlib2::{parse_script, LraProblem, SmtError};
-use tpt_solver::reference::{solve_and_check, solve_and_check_cdcl, solve_and_check_lra, Problem};
+use tpt_solver::reference::{
+    solve_and_check, solve_and_check_arrays, solve_and_check_bv, solve_and_check_cdcl,
+    solve_and_check_lra, Problem,
+};
 use tpt_solver_check::outcome::Outcome;
 use tpt_solver_core::engine::SolveResult;
 
@@ -36,6 +39,10 @@ fn main() {
                     }
                 }
                 i += 2;
+            }
+            "--bench" => {
+                run_bench();
+                return;
             }
             other => {
                 if path.is_none() && !other.starts_with('-') {
@@ -165,10 +172,62 @@ fn run_smtlib2(path: &str, fuel: u64) {
             return;
         }
         Err(SmtError::Unsupported(_)) => {
-            // Not linear arithmetic; try the propositional path.
+            // Not linear arithmetic; try the bit-vector path.
         }
         Err(e) => {
             eprintln!("error: LRA lowering failed: {}", e);
+            std::process::exit(2);
+        }
+    }
+
+    match script.to_bv() {
+        Ok(prob) => {
+            println!("lowering: QF_BV ({} vars)", prob.names.len());
+            let (claim, verdict) = solve_and_check_bv(prob.var_count, &prob.assertions, fuel);
+            print_verdict("BV engine", claim, verdict);
+            if claim == SolveResult::Sat {
+                // Deterministic engine: re-solving yields the same model.
+                if let Some(tpt_solver_core::bv::BvOutcome::Sat(model)) =
+                    tpt_solver_core::bv::solve_bv(prob.var_count, &prob.assertions, fuel)
+                {
+                    println!(
+                        "model: {:?}",
+                        prob.names.iter().zip(&model.values).collect::<Vec<_>>()
+                    );
+                }
+            }
+            return;
+        }
+        Err(SmtError::Unsupported(_)) => {
+            // Not bit-vector; try the array path.
+        }
+        Err(e) => {
+            eprintln!("error: BV lowering failed: {}", e);
+            std::process::exit(2);
+        }
+    }
+
+    match script.to_array() {
+        Ok(prob) => {
+            println!(
+                "lowering: QF_AX ({} arrays, {} elements)",
+                prob.avars.len(),
+                prob.evars.len()
+            );
+            let (claim, verdict) = solve_and_check_arrays(
+                prob.avars.len() as u32,
+                prob.evars.len() as u32,
+                &prob.assertions,
+                fuel,
+            );
+            print_verdict("AX engine", claim, verdict);
+            return;
+        }
+        Err(SmtError::Unsupported(_)) => {
+            // Not arrays; try the propositional path.
+        }
+        Err(e) => {
+            eprintln!("error: array lowering failed: {}", e);
             std::process::exit(2);
         }
     }
@@ -205,6 +264,72 @@ fn extract_lra_model(
 fn solve_model(problem: &Problem, fuel: u64) -> Option<Vec<bool>> {
     let ans = tpt_solver_core::sat::solve_cnf(problem.var_count, &problem.clauses, fuel);
     ans.model
+}
+
+/// Local performance harness: a deterministic random 3-SAT ladder around the
+/// phase transition, run through the full certified CDCL pipeline.
+///
+/// This is the offline scaffolding for the SAT-COMP/SMT-COMP benchmark item —
+/// real competition runs additionally need the official corpora and hardware,
+/// but this ladder catches gross performance regressions in CI-sized time.
+fn run_bench() {
+    use std::time::Instant;
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+        fn below(&mut self, n: u32) -> u32 {
+            (self.next() % n as u64) as u32
+        }
+    }
+
+    println!("bench: random 3-SAT ladder, certified CDCL pipeline (5 seeds each)");
+    println!(
+        "{:>6} {:>8} {:>12} {:>7}",
+        "vars", "clauses", "mean_ms", "sat%"
+    );
+    for &n in &[100usize, 200, 300, 400, 500] {
+        let m = ((n as f64) * 4.26).round() as usize; // near the phase transition
+        let mut total_us = 0u128;
+        let mut sat_count = 0u32;
+        let runs = 5u32;
+        for seed in 0..runs {
+            let mut rng = Lcg(0xBADC0DE ^ (n as u64) ^ ((seed as u64) * 7_919));
+            let mut clauses: Vec<Vec<i32>> = Vec::with_capacity(m);
+            for _ in 0..m {
+                let mut c = Vec::with_capacity(3);
+                for _ in 0..3 {
+                    let v = 1 + rng.below(n as u32);
+                    let sign: i32 = if rng.below(2) == 0 { 1 } else { -1 };
+                    c.push(sign * v as i32);
+                }
+                clauses.push(c);
+            }
+            let problem = Problem {
+                var_count: n as u32,
+                clauses,
+            };
+            let start = Instant::now();
+            let (claim, _verdict, _dump) =
+                tpt_solver::policy::solve_certified(&problem, 50_000_000);
+            total_us += start.elapsed().as_micros();
+            if claim == SolveResult::Sat {
+                sat_count += 1;
+            }
+        }
+        println!(
+            "{:>6} {:>8} {:>12.1} {:>6.0}%",
+            n,
+            m,
+            total_us as f64 / runs as f64 / 1000.0,
+            100.0 * sat_count as f64 / runs as f64
+        );
+    }
 }
 
 fn run_demo() {

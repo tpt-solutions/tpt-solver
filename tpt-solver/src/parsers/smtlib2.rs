@@ -1,9 +1,10 @@
-//! SMT-LIB2 parser (QF_LRA / QF_LIA / QF_SAT subset).
+//! SMT-LIB2 parser (QF_LRA / QF_LIA / QF_SAT / QF_BV / QF_AX subsets).
 //!
-//! This implements the parser half of the Phase 4 periphery. Parsers are the fuzzing
-//! surface of the suite, so the reader here is written to fail safely (a typed
-//! [`SmtError`]) on malformed or out-of-subset input rather than panicking, and it is
-//! paired with a `cargo-fuzz` target under `fuzz/`.
+//! This implements the parser half of the Phase 4 periphery plus the Phase 5
+//! theory front ends. Parsers are the fuzzing surface of the suite, so the
+//! reader here is written to fail safely (a typed [`SmtError`]) on malformed
+//! or out-of-subset input rather than panicking, and it is paired with a
+//! `cargo-fuzz` target under `fuzz/`.
 //!
 //! ## Supported subset
 //!
@@ -15,13 +16,25 @@
 //!   limitation of exact rational arithmetic over the reals).
 //! * Arithmetic `+ - * /` where `*`/`/` take a constant numeric operand, so the term
 //!   stays *linear* (QF_LRA). Integer-sorted variables are handled as reals.
+//! * Bit vectors (`QF_BV`): `(_ BitVec n)` sorts with `n <= 64`, literals
+//!   `#x..`/`#b..`, operators `bvnot bvneg bvand bvor bvxor bvadd bvsub bvshl
+//!   bvlshr bvult concat ((_ extract i j) t)`. Shifts must be by constant
+//!   literals.
+//! * Arrays (`QF_AX`): `(Array S T)` sorts, `select`/`store`, and constant
+//!   arrays via `((as const (Array S T)) v)`. The element universe is
+//!   non-negative 64-bit integers regardless of the declared index/value
+//!   sorts.
 //!
-//! ## Two compilation targets
+//! ## Compilation targets
 //!
 //! * [`Script::to_lra`] flattens a conjunction of linear comparisons into
 //!   [`LinConstraint`]s and solves via Fourier–Motzkin (UNSAT, Farkas-certified) and
 //!   Simplex (SAT model, re-checked by the kernel). Disjunctions/non-linear terms
 //!   yield [`SmtError::Unsupported`].
+//! * [`Script::to_bv`] lowers conjunctions of bit-vector equalities/comparisons
+//!   for bit-blasting onto the certified CDCL engine.
+//! * [`Script::to_array`] lowers ground array equalities for the congruence-
+//!   closure engine with its axiom-instance certificates.
 //! * [`Script::to_cnf`] Tseitin-encodes a *propositional* formula into a DIMACS-style
 //!   [`Problem`] for the CDCL engine (non-arithmetic QF_SAT).
 
@@ -289,7 +302,8 @@ fn sexp_to_term(s: &Sexp) -> Result<Term, SmtError> {
                         }
                         "as" => {
                             // ((as const (Array S T)) v): a constant array.
-                            let is_const_array = matches!(head.get(1), Some(Sexp::Atom(a)) if a == "const");
+                            let is_const_array =
+                                matches!(head.get(1), Some(Sexp::Atom(a)) if a == "const");
                             if is_const_array {
                                 if items.len() != 2 {
                                     return Err(SmtError::BadArity(
@@ -358,18 +372,18 @@ fn atom_to_term(a: &str) -> Term {
 /// Widths above 64 bits are out of subset (`None`, surfacing as an unknown
 /// symbol and later [`SmtError::Unsupported`]).
 fn parse_bv_literal(a: &str) -> Option<Term> {
-    let (val, width) = if let Some(hex) = a.strip_prefix("#x") {
-        if hex.is_empty() || hex.len() > 16 {
-            return None;
+    let (val, width) = match a.strip_prefix("#x") {
+        Some(hex) if !hex.is_empty() && hex.len() <= 16 => {
+            (u64::from_str_radix(hex, 16).ok()?, (hex.len() * 4) as u8)
         }
-        (u64::from_str_radix(hex, 16).ok()?, (hex.len() * 4) as u8)
-    } else if let Some(bin) = a.strip_prefix("#b") {
-        if bin.is_empty() || bin.len() > 64 {
-            return None;
+        Some(hex) if !hex.is_empty() => return None,
+        _ => {
+            let bin = a.strip_prefix("#b")?;
+            if bin.is_empty() || bin.len() > 64 {
+                return None;
+            }
+            (u64::from_str_radix(bin, 2).ok()?, bin.len() as u8)
         }
-        (u64::from_str_radix(bin, 2).ok()?, bin.len() as u8)
-    } else {
-        return None;
     };
     Some(Term::BvLit(val, width))
 }
@@ -380,7 +394,10 @@ fn parse_index(s: Option<&Sexp>, pos: usize) -> Result<u32, SmtError> {
         Some(Sexp::Atom(a)) => a
             .parse::<u32>()
             .map_err(|_| SmtError::Parse(format!("bad index at position {}: {:?}", pos, a))),
-        _ => Err(SmtError::Parse(format!("missing index at position {}", pos))),
+        _ => Err(SmtError::Parse(format!(
+            "missing index at position {}",
+            pos
+        ))),
     }
 }
 
@@ -582,8 +599,8 @@ impl Script {
         let mut assertions = Vec::new();
         collect_bv_assertions(&combined, &mut ctx, &mut assertions)?;
         Ok(BvProblem {
-            var_count: ctx.vars.len() as u32,
-            names: ctx.names(),
+            var_count: ctx.names.len() as u32,
+            names: ctx.names.clone(),
             assertions,
         })
     }
@@ -1095,9 +1112,30 @@ impl Encoder {
             | Term::App(Op::Add, _)
             | Term::App(Op::Sub, _)
             | Term::App(Op::Mul, _)
-            | Term::App(Op::Div, _) => {
+            | Term::App(Op::Div, _)
+            | Term::App(
+                Op::BvNot
+                | Op::BvNeg
+                | Op::BvAnd
+                | Op::BvOr
+                | Op::BvXor
+                | Op::BvAdd
+                | Op::BvSub
+                | Op::BvShl
+                | Op::BvLShr
+                | Op::BvUlt
+                | Op::Concat
+                | Op::Select
+                | Op::Store,
+                _,
+            ) => {
                 return Err(SmtError::Unsupported(
                     "non-boolean term in a boolean formula".into(),
+                ))
+            }
+            Term::BvLit(_, _) | Term::Extract(_, _) | Term::ConstArray(_) => {
+                return Err(SmtError::Unsupported(
+                    "theory constant in a boolean formula".into(),
                 ))
             }
         };
@@ -1224,9 +1262,11 @@ fn collect_bv_assertions(
             }
             let l = bv_term(&args[0], ctx)?;
             let r = bv_term(&args[1], ctx)?;
-            BvAssertion::eq(l, r).ok_or_else(|| {
+            let a = BvAssertion::eq(l, r).ok_or_else(|| {
                 SmtError::Unsupported("bit-vector equality width mismatch".into())
-            })
+            })?;
+            out.push(a);
+            Ok(())
         }
         Term::App(Op::BvUlt, args) => {
             if args.len() != 2 {
@@ -1234,9 +1274,11 @@ fn collect_bv_assertions(
             }
             let l = bv_term(&args[0], ctx)?;
             let r = bv_term(&args[1], ctx)?;
-            BvAssertion::ult(l, r).ok_or_else(|| {
+            let a = BvAssertion::ult(l, r).ok_or_else(|| {
                 SmtError::Unsupported("bit-vector comparison width mismatch".into())
-            })
+            })?;
+            out.push(a);
+            Ok(())
         }
         _ => Err(SmtError::Unsupported(
             "QF_BV lowering supports only conjunctions of = and bvult".into(),
@@ -1314,21 +1356,20 @@ fn bv_term(term: &Term, ctx: &BvCtx) -> Result<BvTerm, SmtError> {
                 }
                 Op::Concat => {
                     need(2)?;
-                    BvTerm::concat(a0()?, a1()?)
-                        .ok_or_else(|| SmtError::Unsupported("concatenation exceeds 64 bits".into()))
+                    BvTerm::concat(a0()?, a1()?).ok_or_else(|| {
+                        SmtError::Unsupported("concatenation exceeds 64 bits".into())
+                    })
                 }
                 Op::BvShl | Op::BvLShr => {
                     need(2)?;
                     let amt = match &args[1] {
                         // Amounts >= any width collapse to "yield 0", so 64 is
                         // a faithful saturation point for widths <= 64.
-                        Term::BvLit(v, _) => Some(v.min(64) as u8),
+                        Term::BvLit(v, _) => Some((*v).min(64) as u8),
                         _ => None,
                     }
                     .ok_or_else(|| {
-                        SmtError::Unsupported(
-                            "shifts must be by a constant #x/#b literal".into(),
-                        )
+                        SmtError::Unsupported("shifts must be by a constant #x/#b literal".into())
                     })?;
                     let arg = a0()?;
                     if *op == Op::BvShl {
@@ -1346,6 +1387,190 @@ fn bv_term(term: &Term, ctx: &BvCtx) -> Result<BvTerm, SmtError> {
         }
         _ => Err(SmtError::Unsupported(
             "term is not a bit-vector expression".into(),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Array lowering (QF_AX subset)
+// ---------------------------------------------------------------------------
+
+/// A lowered QF_AX problem, ready for the core's congruence-closure engine.
+#[derive(Debug, Clone)]
+pub struct ArrayProblem {
+    /// Number of array variables.
+    pub avar_count: u32,
+    /// Number of element variables.
+    pub evar_count: u32,
+    /// Array variable names by id.
+    pub avars: Vec<String>,
+    /// Element variable names by id.
+    pub evars: Vec<String>,
+    /// The conjunction of asserted equalities.
+    pub assertions: Vec<ArrAssertion>,
+}
+
+#[derive(Default)]
+struct AxParserCtx {
+    avars: Vec<String>,
+    evars: Vec<String>,
+    aidx: HashMap<String, u32>,
+    eidx: HashMap<String, u32>,
+}
+
+impl AxParserCtx {
+    fn intern_elem(&mut self, name: &str) {
+        if !self.eidx.contains_key(name) {
+            let id = self.evars.len() as u32;
+            self.evars.push(name.to_string());
+            self.eidx.insert(name.to_string(), id);
+        }
+    }
+
+    fn intern_arr(&mut self, name: &str) {
+        if !self.aidx.contains_key(name) {
+            let id = self.avars.len() as u32;
+            self.avars.push(name.to_string());
+            self.aidx.insert(name.to_string(), id);
+        }
+    }
+}
+
+fn ax_const(r: &Rational) -> Result<u64, SmtError> {
+    r.to_u64().ok_or_else(|| {
+        SmtError::Unsupported(
+            "array element constants must be non-negative integers fitting in u64".into(),
+        )
+    })
+}
+
+enum AxSide {
+    Elem(ElemExpr),
+    Array(ArrayExpr),
+}
+
+fn collect_ax_assertions(
+    term: &Term,
+    ctx: &mut AxParserCtx,
+    out: &mut Vec<ArrAssertion>,
+) -> Result<(), SmtError> {
+    match term {
+        Term::App(Op::And, args) => {
+            for a in args {
+                collect_ax_assertions(a, ctx, out)?;
+            }
+            Ok(())
+        }
+        Term::Bool(true) => Ok(()),
+        Term::App(Op::Eq, args) => {
+            if args.len() != 2 {
+                return Err(SmtError::BadArity("equality expects 2 arguments".into()));
+            }
+            match (ax_side(&args[0], ctx)?, ax_side(&args[1], ctx)?) {
+                (AxSide::Elem(l), AxSide::Elem(r)) => {
+                    out.push(ArrAssertion::ElemsEqual(l, r));
+                    Ok(())
+                }
+                (AxSide::Array(l), AxSide::Array(r)) => {
+                    out.push(ArrAssertion::ArraysEqual(l, r));
+                    Ok(())
+                }
+                _ => Err(SmtError::Unsupported(
+                    "equality between an array and an element".into(),
+                )),
+            }
+        }
+        _ => Err(SmtError::Unsupported(
+            "QF_AX lowering supports only conjunctions of equalities".into(),
+        )),
+    }
+}
+
+/// Classify and lower one side of an equality; the symbol's declared sort
+/// decides whether it is an array or an element.
+fn ax_side(term: &Term, ctx: &mut AxParserCtx) -> Result<AxSide, SmtError> {
+    match term {
+        Term::Sym(name) => {
+            if let Some(&id) = ctx.aidx.get(name) {
+                return Ok(AxSide::Array(ArrayExpr::AVar(id)));
+            }
+            if let Some(&id) = ctx.eidx.get(name) {
+                return Ok(AxSide::Elem(ElemExpr::Var(id)));
+            }
+            Err(SmtError::Unsupported(format!(
+                "unknown symbol {:?} in the array problem",
+                name
+            )))
+        }
+        Term::Num(r) => Ok(AxSide::Elem(ElemExpr::Const(ax_const(r)?))),
+        Term::ConstArray(v) => {
+            let val = match ax_side(v, ctx)? {
+                AxSide::Elem(e) => e,
+                AxSide::Array(_) => {
+                    return Err(SmtError::Unsupported(
+                        "const-array value must be an element".into(),
+                    ))
+                }
+            };
+            Ok(AxSide::Array(ArrayExpr::ConstArray(Box::new(val))))
+        }
+        Term::App(op, args) => match op {
+            Op::Select => {
+                if args.len() != 2 {
+                    return Err(SmtError::BadArity("select expects 2 arguments".into()));
+                }
+                let arr = match ax_side(&args[0], ctx)? {
+                    AxSide::Array(a) => a,
+                    AxSide::Elem(_) => {
+                        return Err(SmtError::Unsupported(
+                            "select applied to a non-array term".into(),
+                        ))
+                    }
+                };
+                let idx = match ax_side(&args[1], ctx)? {
+                    AxSide::Elem(e) => e,
+                    AxSide::Array(_) => {
+                        return Err(SmtError::Unsupported(
+                            "select index must be an element".into(),
+                        ))
+                    }
+                };
+                Ok(AxSide::Elem(ElemExpr::select(arr, idx)))
+            }
+            Op::Store => {
+                if args.len() != 3 {
+                    return Err(SmtError::BadArity("store expects 3 arguments".into()));
+                }
+                let arr = match ax_side(&args[0], ctx)? {
+                    AxSide::Array(a) => a,
+                    AxSide::Elem(_) => {
+                        return Err(SmtError::Unsupported("store applied to a non-array".into()))
+                    }
+                };
+                let idx = match ax_side(&args[1], ctx)? {
+                    AxSide::Elem(e) => e,
+                    AxSide::Array(_) => {
+                        return Err(SmtError::Unsupported(
+                            "store index must be an element".into(),
+                        ))
+                    }
+                };
+                let val = match ax_side(&args[2], ctx)? {
+                    AxSide::Elem(e) => e,
+                    AxSide::Array(_) => {
+                        return Err(SmtError::Unsupported(
+                            "store value must be an element".into(),
+                        ))
+                    }
+                };
+                Ok(AxSide::Array(ArrayExpr::store(arr, idx, val)))
+            }
+            _ => Err(SmtError::Unsupported(
+                "operator not supported in the QF_AX subset".into(),
+            )),
+        },
+        _ => Err(SmtError::Unsupported(
+            "term is not an array-theory term".into(),
         )),
     }
 }
@@ -1431,5 +1656,94 @@ mod tests {
 ";
         let script = parse_script(src).unwrap();
         assert!(matches!(script.to_lra(), Err(SmtError::Unsupported(_))));
+    }
+
+    #[test]
+    fn bv_script_lowens_and_solves_sat() {
+        // x + 1 == 0 at width 4 forces x = #xF; also exercises a shift.
+        let src = "
+(set-logic QF_BV)
+(declare-fun x () (_ BitVec 4))
+(assert (= (bvadd x #x1) #x0))
+(assert (= (bvshl x #x1) #xe))
+(check-sat)
+";
+        let script = parse_script(src).unwrap();
+        let prob = script.to_bv().unwrap();
+        assert_eq!(prob.var_count, 1);
+        let (claim, verdict) =
+            crate::reference::solve_and_check_bv(prob.var_count, &prob.assertions, 1_000_000);
+        assert_eq!(claim, tpt_solver_core::engine::SolveResult::Sat);
+        assert!(verdict.is_accept());
+    }
+
+    #[test]
+    fn bv_script_unsat_with_concat_extract() {
+        // concat(x, y) == 0xFF and extract(bits 7..=4) == 0x0 cannot both hold.
+        let src = "
+(set-logic QF_BV)
+(declare-fun x () (_ BitVec 4))
+(declare-fun y () (_ BitVec 4))
+(assert (= (concat x y) #xff))
+(assert (= ((_ extract 7 4) (concat x y)) #x0))
+(check-sat)
+";
+        let script = parse_script(src).unwrap();
+        let prob = script.to_bv().unwrap();
+        assert_eq!(prob.var_count, 2);
+        let (claim, verdict) =
+            crate::reference::solve_and_check_bv(prob.var_count, &prob.assertions, 1_000_000);
+        assert_eq!(claim, tpt_solver_core::engine::SolveResult::Unsat);
+        assert!(
+            verdict.is_accept(),
+            "kernel should Accept the LRAT proof over the blast"
+        );
+    }
+
+    #[test]
+    fn ax_script_unsat_store_read_conflict() {
+        let src = "
+(set-logic QF_AX)
+(declare-fun a () (Array Int Int))
+(declare-fun i () Int)
+(assert (= (select (store a i 5) i) 7))
+(check-sat)
+";
+        let script = parse_script(src).unwrap();
+        let prob = script.to_array().unwrap();
+        assert_eq!(prob.avars.len(), 1);
+        assert_eq!(prob.evars.len(), 1);
+        let (claim, verdict) = crate::reference::solve_and_check_arrays(
+            prob.avars.len() as u32,
+            prob.evars.len() as u32,
+            &prob.assertions,
+            100_000,
+        );
+        assert_eq!(claim, tpt_solver_core::engine::SolveResult::Unsat);
+        assert!(
+            verdict.is_accept(),
+            "kernel should Accept the axiom-instance certificate"
+        );
+    }
+
+    #[test]
+    fn ax_script_sat_with_const_array() {
+        // select(constarray(7), j) == 7 for any j: SAT via the const-array axiom.
+        let src = "
+(set-logic QF_AX)
+(declare-fun j () Int)
+(assert (= (select ((as const (Array Int Int)) 7) j) 7))
+(check-sat)
+";
+        let script = parse_script(src).unwrap();
+        let prob = script.to_array().unwrap();
+        let (claim, verdict) = crate::reference::solve_and_check_arrays(
+            prob.avars.len() as u32,
+            prob.evars.len() as u32,
+            &prob.assertions,
+            100_000,
+        );
+        assert_eq!(claim, tpt_solver_core::engine::SolveResult::Sat);
+        assert!(verdict.is_accept());
     }
 }

@@ -5,7 +5,9 @@
 
 use libfuzzer_sys::fuzz_target;
 use tpt_solver::parsers::smtlib2::parse_script;
-use tpt_solver::reference::{solve_and_check_cdcl, solve_and_check_lra};
+use tpt_solver::reference::{
+    solve_and_check_arrays, solve_and_check_bv, solve_and_check_cdcl, solve_and_check_lra,
+};
 
 fuzz_target!(|data: &[u8]| {
     let Ok(text) = std::str::from_utf8(data) else {
@@ -22,5 +24,16 @@ fuzz_target!(|data: &[u8]| {
     }
     if let Ok(problem) = script.to_cnf() {
         let _ = solve_and_check_cdcl(&problem, 1_000_000);
+    }
+    if let Ok(prob) = script.to_bv() {
+        let _ = solve_and_check_bv(prob.var_count, &prob.assertions, 1_000_000);
+    }
+    if let Ok(prob) = script.to_array() {
+        let _ = solve_and_check_arrays(
+            prob.avars.len() as u32,
+            prob.evars.len() as u32,
+            &prob.assertions,
+            1_000_000,
+        );
     }
 });

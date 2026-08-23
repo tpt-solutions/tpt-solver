@@ -121,6 +121,30 @@ fn term_to_expr(term: &Term, expr: &mut RecExpr<BoolLang>) -> Result<Id, SmtErro
         Term::Num(_) => Err(SmtError::Unsupported(
             "numeric constant in boolean position".into(),
         )),
+        // Non-propositional theories (QF_BV / QF_AX terms) are out of the
+        // e-graph's Boolean fragment; they fail the same way the Tseitin
+        // encoder would, after simplification.
+        Term::BvLit(_, _)
+        | Term::Extract(_, _)
+        | Term::ConstArray(_)
+        | Term::App(
+            Op::BvNot
+            | Op::BvNeg
+            | Op::BvAnd
+            | Op::BvOr
+            | Op::BvXor
+            | Op::BvAdd
+            | Op::BvSub
+            | Op::BvShl
+            | Op::BvLShr
+            | Op::BvUlt
+            | Op::Concat
+            | Op::Select
+            | Op::Store,
+            _,
+        ) => Err(SmtError::Unsupported(
+            "non-Boolean theory term in a propositional formula".into(),
+        )),
         Term::App(Op::Not, args) => {
             if args.len() != 1 {
                 return Err(SmtError::BadArity("not expects 1 argument".into()));
