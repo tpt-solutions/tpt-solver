@@ -13,6 +13,7 @@
 //! * **Rates are tracked** (`VerdictTracker`) — accept/reject/inconclusive as a triad,
 //!   so "safe but unproductive" regressions are visible, not just soundness bugs.
 
+use crate::portfolio::solve_and_check_cdcl_portfolio;
 use crate::reference::{solve_and_check, solve_and_check_cdcl, Problem};
 use tpt_solver_check::outcome::Outcome;
 use tpt_solver_core::engine::SolveResult;
@@ -137,15 +138,49 @@ pub fn solve_certified(
     if verdict.is_accept() {
         return (claim, verdict, None);
     }
-
     let first_engine: &'static str = match claim {
         SolveResult::Sat => "cdcl(sat)",
         SolveResult::Unsat => "cdcl(unsat)",
         SolveResult::Unknown => "cdcl(unknown)",
     };
-    let cert_present = claim != SolveResult::Unknown;
+    fallback_after_cdcl_reject(problem, fuel, first_engine, claim != SolveResult::Unknown)
+}
 
-    // Fallback tier: simpler, exhaustively-tested solver (reference DPLL), recertified.
+/// Like [`solve_certified`], but Tier 0 races `workers` diverse CDCL workers
+/// against the problem instead of running one sequentially
+/// ([`solve_and_check_cdcl_portfolio`]) — the same fail-closed guarantee,
+/// usually faster on the happy path. Falls through to the exact same
+/// reference-DPLL / `Unknown`+dump tiers on a non-`Accept` race.
+pub fn solve_certified_portfolio(
+    problem: &Problem,
+    fuel_per_worker: u64,
+    workers: usize,
+) -> (SolveResult, Outcome, Option<RejectionDump>) {
+    let (claim, verdict) = solve_and_check_cdcl_portfolio(problem, fuel_per_worker, workers);
+    if verdict.is_accept() {
+        return (claim, verdict, None);
+    }
+    let first_engine: &'static str = match claim {
+        SolveResult::Sat => "cdcl-portfolio(sat)",
+        SolveResult::Unsat => "cdcl-portfolio(unsat)",
+        SolveResult::Unknown => "cdcl-portfolio(unknown)",
+    };
+    fallback_after_cdcl_reject(
+        problem,
+        fuel_per_worker,
+        first_engine,
+        claim != SolveResult::Unknown,
+    )
+}
+
+/// Shared Tier 1 (reference DPLL, recertified) / Tier 2 (`Unknown` + dump)
+/// fallback, reused after either a sequential or portfolio CDCL reject.
+fn fallback_after_cdcl_reject(
+    problem: &Problem,
+    fuel: u64,
+    first_engine: &'static str,
+    cert_present: bool,
+) -> (SolveResult, Outcome, Option<RejectionDump>) {
     let (claim2, verdict2) = solve_and_check(problem, fuel);
     if verdict2.is_accept() {
         let dump = RejectionDump {

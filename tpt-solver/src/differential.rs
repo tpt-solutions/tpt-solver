@@ -448,7 +448,7 @@ fn gen_bv_term(rng: &mut Lcg, vars: u32, width: u8, depth: u32) -> BvTerm {
             let hi_i = rng.below(width as u32) as u8;
             let lo_i = rng.below(hi_i as u32 + 1) as u8;
             let slice = BvTerm::extract(cat, hi_i, lo_i).expect("in-range extract");
-            let hw = (hi_i - lo_i + 1) as u8;
+            let hw = hi_i - lo_i + 1;
             if hw >= width {
                 slice
             } else {
@@ -578,7 +578,7 @@ fn bv_z3_serialization_roundtrips_through_own_parser() {
 
         let assertions = [assertion];
         let (direct, dv) = solve_and_check_bv(vars, &assertions, 10_000_000);
-        let (rt, rv) = solve_and_check_bv(prob.var_count, &prob.assertions, 10_000_000);
+        let (rt, _rv) = solve_and_check_bv(prob.var_count, &prob.assertions, 10_000_000);
         assert_eq!(direct, rt, "round-trip changed the verdict (case {})", case);
         if direct == SolveResult::Unknown {
             // The engine is complete on this fragment: an Unknown here is a

@@ -17,6 +17,7 @@ use tpt_solver_check::sat::{check_model, Cnf, Model};
 use tpt_solver_core::engine::SolveResult;
 use tpt_solver_core::ir::{Lit, VarId};
 use tpt_solver_core::lra::{fourier_motzkin, FmResult, LinConstraint};
+use tpt_solver_core::sat::SatAnswer;
 
 /// A formula in simple (non-branded) CNF: each literal is `var` (positive) or `-var`
 /// (negative), `var` in `1..=var_count`.
@@ -202,16 +203,18 @@ pub fn solve_and_check(
     (result.outcome, verdict)
 }
 
-/// Solve with the optimized CDCL engine ([`tpt_solver_core::sat`]) and validate the
-/// answer through the trusted checker. Returns the engine's claim and the checker's
-/// three-way verdict.
+/// Validate a raw CDCL [`SatAnswer`] against `problem` through the trusted
+/// checker. Returns the engine's claim and the checker's three-way verdict.
 ///
 /// * **SAT** — the model is re-substituted into the original CNF (`check_model`).
 /// * **UNSAT** — the emitted LRAT-style proof is re-validated clause-by-clause via
 ///   [`check_proof`] (each step must be RUP-derivable from the original clauses plus
 ///   earlier steps, ending in the empty clause).
-pub fn solve_and_check_cdcl(problem: &Problem, fuel: u64) -> (SolveResult, Outcome) {
-    let ans = tpt_solver_core::sat::solve_cnf(problem.var_count, &problem.clauses, fuel);
+///
+/// Shared by [`solve_and_check_cdcl`] and the portfolio race in
+/// [`crate::portfolio`] — every CDCL answer, however it was produced, goes
+/// through this exact same trusted-checker logic.
+pub fn check_cdcl_answer(problem: &Problem, ans: SatAnswer) -> (SolveResult, Outcome) {
     match ans.result {
         SolveResult::Sat => {
             let verdict = match ans.model {
@@ -247,6 +250,14 @@ pub fn solve_and_check_cdcl(problem: &Problem, fuel: u64) -> (SolveResult, Outco
         }
         SolveResult::Unknown => (SolveResult::Unknown, Outcome::Inconclusive),
     }
+}
+
+/// Solve with the optimized CDCL engine ([`tpt_solver_core::sat`]) and validate the
+/// answer through the trusted checker. Returns the engine's claim and the checker's
+/// three-way verdict.
+pub fn solve_and_check_cdcl(problem: &Problem, fuel: u64) -> (SolveResult, Outcome) {
+    let ans = tpt_solver_core::sat::solve_cnf(problem.var_count, &problem.clauses, fuel);
+    check_cdcl_answer(problem, ans)
 }
 
 /// Solve a QF_LRA problem: Fourier–Motzkin decides feasibility and emits a Farkas

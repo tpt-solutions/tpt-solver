@@ -9,6 +9,15 @@ repository.workspace = true
 description = "Untrusted but high-performance solving engine (CDCL, DPLL(T), Simplex) for the tpt-solver suite"
 
 [dependencies]
+# Model-checks every thread interleaving of `cancel::Cancel`'s shared flag
+# (the one piece of shared-state concurrency this crate introduces, for
+# portfolio SAT solving) under `--cfg loom`; see `tests/loom_cancel.rs`. Optional
+# and off by default (not in `default`), so the crate stays zero-dependency for
+# every normal build; `cargo test --features loom` is the only way to pull it in.
+# (A `[dev-dependencies]` entry can't work here: Cargo does not expose
+# dev-dependencies to the crate's own lib compilation unit, only to its test/
+# bench/example targets, and `cfg(loom)` lives in ordinary `src/` code.)
+loom = { version = "0.7", optional = true }
 
 [dev-dependencies]
 # Property-testing of the bounded linear-arithmetic invariants that `tpt-telos`
@@ -23,3 +32,11 @@ num-rational = "0.4"
 [features]
 default = ["std"]
 std = []
+loom = ["dep:loom"]
+
+[lints.rust]
+# `cfg(kani)` is set by the Kani toolchain and `cfg(loom)` by `RUSTFLAGS`
+# (see the `loom` feature above) — neither is a Cargo-known cfg name, so
+# both must be registered here to avoid an `unexpected_cfgs` warning on
+# every target (lib, and `tests/loom_cancel.rs`) in every build.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(loom)"] }

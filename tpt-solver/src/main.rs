@@ -8,6 +8,7 @@
 //! tpt-solver FILE.mps        # parse a free-format LP-MPS file, solve the LRA
 //!                             # feasibility system (no objective optimization), certify
 //! tpt-solver FILE.cnf --fuel N
+//! tpt-solver FILE.cnf --parallel N   # race N diverse CDCL workers (DIMACS only)
 //! ```
 //!
 //! Every answer is revalidated by the trusted checker (`tpt-solver-check`); the
@@ -17,6 +18,7 @@
 use tpt_solver::parsers::dimacs::parse_dimacs;
 use tpt_solver::parsers::mps::parse_mps;
 use tpt_solver::parsers::smtlib2::{parse_script, LraProblem, SmtError};
+use tpt_solver::policy::solve_certified_portfolio;
 use tpt_solver::reference::{
     solve_and_check, solve_and_check_arrays, solve_and_check_bv, solve_and_check_cdcl,
     solve_and_check_lra, Problem,
@@ -28,6 +30,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut path: Option<&str> = None;
     let mut fuel: u64 = 10_000_000;
+    let mut parallel: Option<usize> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -36,6 +39,14 @@ fn main() {
                 if let Some(next) = args.get(i + 1) {
                     if let Ok(f) = next.parse() {
                         fuel = f;
+                    }
+                }
+                i += 2;
+            }
+            "--parallel" => {
+                if let Some(next) = args.get(i + 1) {
+                    if let Ok(n) = next.parse() {
+                        parallel = Some(n);
                     }
                 }
                 i += 2;
@@ -54,19 +65,19 @@ fn main() {
     }
 
     match path {
-        Some(p) => run_file(p, fuel),
+        Some(p) => run_file(p, fuel, parallel),
         None => run_demo(),
     }
 }
 
-fn run_file(path: &str, fuel: u64) {
+fn run_file(path: &str, fuel: u64, parallel: Option<usize>) {
     if path.ends_with(".smt2") || path.ends_with(".smt") {
         return run_smtlib2(path, fuel);
     }
     if path.ends_with(".mps") {
         return run_mps(path, fuel);
     }
-    run_dimacs(path, fuel);
+    run_dimacs(path, fuel, parallel);
 }
 
 fn run_mps(path: &str, fuel: u64) {

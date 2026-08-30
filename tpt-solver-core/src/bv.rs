@@ -837,34 +837,135 @@ mod tests {
     }
 
     #[test]
-    fn tmp_and_bug_debug() {
-        // x1 <u (x0|x1) & (x1&x0): RHS == x0&x1 <= x1 always => UNSAT.
+    fn bv_self_xor_equation_is_sat() {
+        // (x0^x0) & (x0+x0) == (x0|x0) ^ (x0^x0) reduces to 0 == x0, so
+        // x0 = 0 satisfies it. This is the formula that exposed a second CDCL
+        // `analyze()` bug beyond the satisfied-literal one above: `propagate`
+        // does not guarantee the propagated literal sits at index 0 of its
+        // reason clause (a watch swap can leave it at index 1), so skipping
+        // index 0 on non-initial resolution steps silently dropped a real
+        // antecedent literal, corrupting the derivation into a bogus learnt
+        // unit clause and a false `Unsat`.
+        let x0 = v(0, 3);
+        let lhs = BvTerm::and(
+            BvTerm::xor(x0.clone(), x0.clone()).unwrap(),
+            BvTerm::add(x0.clone(), x0.clone()).unwrap(),
+        )
+        .unwrap();
+        let rhs = BvTerm::xor(
+            BvTerm::or(x0.clone(), x0.clone()).unwrap(),
+            BvTerm::xor(x0.clone(), x0.clone()).unwrap(),
+        )
+        .unwrap();
+        let asserts = vec![eq(lhs, rhs)];
+        match solve_bv(1, &asserts, 10_000_000) {
+            Some(BvOutcome::Sat(m)) => assert_eq!(m.values[0], 0),
+            other => panic!("engine should find x0=0 satisfiable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn blast_bv_agrees_with_semantics() {
+        // Trusted oracle: random QF_BV assertions must be equisatisfiable between
+        // the semantic evaluator (`eval_bv`) and the bit-blast encoder. A mismatch
+        // means the encoder over-/under-constrains. Catches blast soundness bugs.
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+        }
+        let mut rng = Lcg(0x9e3779b9);
+        fn gen_term(rng: &mut Lcg, vars: u32, depth: u32) -> BvTerm {
+            if depth == 0 || rng.below(3) == 0 {
+                return BvTerm::var(rng.below(vars as u64) as u32, 3).unwrap();
+            }
+            let a = gen_term(rng, vars, depth - 1);
+            let b = gen_term(rng, vars, depth - 1);
+            match rng.below(7) {
+                0 => BvTerm::and(a, b).unwrap(),
+                1 => BvTerm::or(a, b).unwrap(),
+                2 => BvTerm::xor(a, b).unwrap(),
+                3 => BvTerm::add(a, b).unwrap(),
+                4 => BvTerm::sub(a, b).unwrap(),
+                5 => BvTerm::not(a).unwrap(),
+                _ => BvTerm::neg(a).unwrap(),
+            }
+        }
+        for _ in 0..5000u32 {
+            let vars = 1 + rng.below(3) as u32; // 1..3 vars
+            let t1 = gen_term(&mut rng, vars, 2);
+            let t2 = gen_term(&mut rng, vars, 2);
+            let asserts = vec![eq(t1.clone(), t2.clone())];
+            // Semantic satisfiability via exhaustive enumeration.
+            let mut semantic = false;
+            let total = 1u64 << (3 * vars);
+            let mut assign = 0u64;
+            while assign < total {
+                let mut vals: Vec<u64> = Vec::with_capacity(vars as usize);
+                for vi in 0..vars {
+                    vals.push((assign >> (3 * vi)) & 0b111);
+                }
+                if assertion_holds(&asserts[0], &vals) == Some(true) {
+                    semantic = true;
+                    break;
+                }
+                assign += 1;
+            }
+            match solve_bv(vars, &asserts, 10_000_000) {
+                Some(BvOutcome::Sat(_)) => {
+                    assert!(
+                        semantic,
+                        "blast SAT but semantics UNSAT: {:?} == {:?}",
+                        t1, t2
+                    );
+                }
+                Some(BvOutcome::Unsat(_)) => {
+                    assert!(
+                        !semantic,
+                        "blast UNSAT but semantics SAT: {:?} == {:?}",
+                        t1, t2
+                    );
+                }
+                None => panic!("engine gave up (bug) on {:?} == {:?}", t1, t2),
+            }
+        }
+    }
+
+    #[test]
+    fn bv_ult_with_absorbing_rhs_is_unsat() {
+        // x1 <u (x0|x1) & (x1&x0): RHS == x0&x1 <= x1 always, so the assertion
+        // x1 <u (x0&x1) is impossible => UNSAT. This is the formula that exposed
+        // the analyse() bug where satisfied literals were marked `seen`, sending
+        // the search into an empty-learnt bail and burning all fuel (Unknown).
         let x0 = v(0, 3);
         let x1 = v(1, 3);
         let or_t = BvTerm::or(x0.clone(), x1.clone()).unwrap();
         let and_t = BvTerm::and(x1.clone(), x0.clone()).unwrap();
         let rhs = BvTerm::and(or_t, and_t).unwrap();
         let asserts = vec![BvAssertion::ult(x1.clone(), rhs).unwrap()];
-        // Brute-force truth:
-        let mut any = false;
+
+        // Brute-force ground truth (3-bit variables => 8*8 cases).
+        let mut satisfiable = false;
         for a in 0..8u64 {
             for b in 0..8u64 {
                 if let Some(true) = assertion_holds(&asserts[0], &[a, b]) {
-                    any = true;
+                    satisfiable = true;
                 }
             }
         }
-        println!("brute force satisfiable = {}", any);
-        // Escalating fuels to distinguish exhaustion from an immediate Unknown.
-        let blasted = blast_bv(2, &asserts).expect("blast");
-        for f in [600u64] {
-            let ans = crate::sat::solve_cnf(blasted.var_count, &blasted.clauses, f);
-            println!("fuel={:>9} -> {:?}", f, ans.result);
-        }
+        assert!(!satisfiable, "precondition: formula must be UNSAT");
+
         match solve_bv(2, &asserts, 10_000_000) {
-            Some(BvOutcome::Unsat(_)) => println!("engine UNSAT (correct)"),
-            Some(BvOutcome::Sat(m)) => println!("engine SAT model={:?} (BUG)", m.values),
-            None => println!("engine gave up (BUG?)"),
+            Some(BvOutcome::Unsat(_)) => {}
+            other => panic!("engine should prove UNSAT, got {:?}", other),
         }
     }
 

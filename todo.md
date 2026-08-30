@@ -191,6 +191,25 @@ Solutions.
       past real contradictions — rewritten as proper first-UIP analysis, and
       `add_learnt` now surfaces falsified learnts as UNSAT instead of ignoring
       the failed enqueue.
+      This pass's oracle tests (`solve_cnf_agrees_with_brute_force`,
+      `blast_bv_agrees_with_semantics`) caught **two further `analyze()` bugs**
+      in that same first-UIP rewrite: (4) satisfied literals were being marked
+      `seen` during clause-literal scanning, corrupting the path-count and
+      sending the trail scan into an unrecoverable empty-learnt bail that
+      burned all fuel to `Unknown` — fixed by only marking a literal `seen`
+      when it is actually falsified (`self.value(q) == Some(false)`); (5) the
+      resolution step assumed, MiniSat-style, that a reason clause always has
+      its propagated literal at index 0, but this engine's `propagate` has no
+      such invariant (a watch swap can leave the propagated literal at index 1
+      instead), so skipping index 0 on non-initial steps silently dropped a
+      real antecedent literal — this produced a *wrong-polarity* unit learnt
+      clause (e.g. asserting a gate output must be `true` when it is
+      structurally forced `false`), a genuine soundness bug, not just an
+      Unknown. Fixed by scanning every literal unconditionally; the earlier
+      `value(q) == Some(false)` guard already excludes the pivot correctly, so
+      the index-based skip was both unneeded and unsafe. Regression tests
+      `bv::tests::bv_self_xor_equation_is_sat` and
+      `sat::tests::solve_cnf_agrees_with_brute_force` cover these.
 - [ ] SAT-COMP/SMT-COMP benchmark runs (performance, not correctness) — still
       open: requires competition hardware, benchmark corpora, and run windows;
       nothing to execute offline.

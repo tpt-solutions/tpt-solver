@@ -18,7 +18,6 @@
 //!   [`SolveResult::Unknown`] on depletion rather than looping forever or panicking.
 
 #![cfg_attr(not(feature = "std"), no_std)]
-#![allow(unexpected_cfgs)] // `cfg(kani)` is set by the Kani toolchain, not by rustc.
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::panic)]
 #![warn(missing_docs)]
@@ -27,6 +26,7 @@ extern crate alloc;
 
 pub mod array;
 pub mod bv;
+pub mod cancel;
 pub mod engine;
 pub mod fuel;
 pub mod ir;

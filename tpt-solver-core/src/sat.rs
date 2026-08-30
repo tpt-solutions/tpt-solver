@@ -13,6 +13,7 @@
 //! The engine is *not* trusted: if it ever emits an unsound clause, the checker
 //! rejects it. The engine itself never panics and always respects its [`Fuel`].
 
+use crate::cancel::Cancel;
 use crate::engine::SolveResult;
 use crate::fuel::Fuel;
 
@@ -70,11 +71,27 @@ pub struct CdclSolver {
     conflicts: u32,
     restart_limit: u32,
     fuel: Fuel,
+    cancel: Cancel,
     proof: Vec<Vec<i32>>,
 }
 
+/// Derive variable `v`'s initial branching polarity from a portfolio `seed`.
+///
+/// A cheap mixing function (not cryptographic — just enough to decorrelate
+/// workers sharing the same `seed=0` baseline). `seed == 0` reproduces the
+/// engine's original always-`true` initial polarity, so [`solve_cnf`]'s
+/// behavior (and every existing test) is unchanged.
+#[inline]
+fn seeded_polarity(seed: u64, v: u32) -> bool {
+    if seed == 0 {
+        return true;
+    }
+    let mixed = (seed ^ v as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    (mixed >> 63) == 1
+}
+
 impl CdclSolver {
-    fn new(n_vars: u32, fuel: Fuel) -> CdclSolver {
+    fn new(n_vars: u32, fuel: Fuel, seed: u64, cancel: Cancel) -> CdclSolver {
         let n = n_vars as usize;
         CdclSolver {
             n_vars,
@@ -88,10 +105,11 @@ impl CdclSolver {
             propagate_head: 0,
             unassigned: n_vars,
             activity: vec![0.0; n],
-            polarity: vec![true; n],
+            polarity: (0..n_vars).map(|v| seeded_polarity(seed, v)).collect(),
             conflicts: 0,
             restart_limit: core::cmp::max(100, n_vars),
             fuel,
+            cancel,
             proof: Vec::new(),
         }
     }
@@ -284,25 +302,39 @@ impl CdclSolver {
         let mut btlevel: usize = 0;
         let mut index = self.trail.len();
         let mut path_c: i32 = 0;
-        let mut p: i32 = 0;
+        let mut p: i32;
         let mut conflict_clause = confl;
         loop {
             let cl = self.clauses[conflict_clause].lits.clone();
-            let start = if p == 0 { 0 } else { 1 };
-            let mut j = start;
+            // Scan every literal, including position 0: unlike MiniSat,
+            // `propagate` does not guarantee the propagated literal sits at
+            // index 0 of its reason clause (a watch swap can leave it at
+            // index 1 instead), so skipping index 0 on non-initial clauses
+            // silently dropped a real antecedent literal from the
+            // resolution. The pivot itself is excluded correctly below by
+            // the `value(q) == Some(false)` guard: it is on the trail as
+            // true, so it never re-qualifies.
+            let mut j = 0;
             while j < cl.len() {
                 let q = cl[j];
-                let v = q.unsigned_abs() as usize;
-                if !seen[v] && self.level[v - 1] > 0 {
-                    seen[v] = true;
-                    self.bump_var_activity(v - 1);
-                    if (self.level[v - 1] as usize) >= self.decision_level() {
-                        path_c += 1;
-                    } else {
-                        learnt.push(q);
-                        let lv = self.level[v - 1] as usize;
-                        if lv > btlevel {
-                            btlevel = lv;
+                let vq = q.unsigned_abs() as usize;
+                if !seen[vq] {
+                    // Only literal-false literals are part of the conflict; a
+                    // satisfied literal plays no role in the resolution and must
+                    // not be marked seen (doing so corrupts the path-count and
+                    // the trail scan, which previously sent the search into an
+                    // unrecoverable empty-learnt bail that burned all fuel).
+                    if self.value(q) == Some(false) {
+                        seen[vq] = true;
+                        self.bump_var_activity(vq - 1);
+                        if (self.level[vq - 1] as usize) >= self.decision_level() {
+                            path_c += 1;
+                        } else {
+                            learnt.push(q);
+                            let lv = self.level[vq - 1] as usize;
+                            if lv > btlevel {
+                                btlevel = lv;
+                            }
                         }
                     }
                 }
@@ -311,16 +343,6 @@ impl CdclSolver {
             // Most recent seen literal on the trail.
             loop {
                 if index == 0 {
-                    #[cfg(test)]
-                    println!(
-                        "UNDERFLOW pathc={} learnt={:?} seen={:?} lims={:?} trail={:?} lvl={}",
-                        path_c,
-                        learnt,
-                        seen,
-                        self.trail_lim,
-                        self.trail,
-                        self.decision_level()
-                    );
                     // Malformed reason chain; bail out (caller restarts at 0).
                     return (Vec::new(), 0);
                 }
@@ -331,29 +353,13 @@ impl CdclSolver {
                 }
             }
             seen[p.unsigned_abs() as usize] = false;
-            #[cfg(test)]
-            println!(
-                "PICK p={} idx={} pc={} reason={:?}",
-                p,
-                index,
-                path_c,
-                self.reason[(p.unsigned_abs() as usize) - 1]
-                    .map(|r| r)
-            );
             path_c -= 1;
             if path_c <= 0 {
                 break;
             }
             match self.reason[(p.unsigned_abs() as usize) - 1] {
                 Some(r) => conflict_clause = r,
-                None => {
-                    #[cfg(test)]
-                    eprintln!(
-                        "BAILD p={} pathc={} learnt={:?} confl={:?}",
-                        p, path_c, learnt, self.clauses[conflict_clause].lits
-                    );
-                    break; // decision var mid-path: bail out
-                }
+                None => break, // decision var mid-path: bail out
             }
         }
         learnt.insert(0, Self::negate(p));
@@ -581,7 +587,11 @@ impl CdclSolver {
 
     fn search(&mut self) -> SolveResult {
         loop {
-            if !self.fuel.burn_one() {
+            // The cancel check is cooperative and cheap (a single `Relaxed`
+            // load): a portfolio caller that already has a checker-accepted
+            // answer from another worker uses it to stop this one promptly,
+            // rather than waiting for its own fuel to run out.
+            if !self.fuel.burn_one() || self.cancel.is_set() {
                 return SolveResult::Unknown;
             }
             match self.propagate() {
@@ -603,19 +613,12 @@ impl CdclSolver {
                     }
                     let (learnt, btlevel) = self.analyze(c);
                     if learnt.is_empty() {
-                        #[cfg(test)]
-                        eprintln!("BAIL at lvl={}", self.decision_level());
-                        self.cancel_until(0);
+                        // An empty learnt means a top-level contradiction: a
+                        // genuine UNSAT (the original BAIL-here recovery looped).
+                        self.proof.push(Vec::new());
+                        return SolveResult::Unsat;
                     } else {
                         self.cancel_until(btlevel);
-                        #[cfg(test)]
-                        eprintln!(
-                            "C{:06} lvl={} -> bt={} learnt={:?}",
-                            self.conflicts,
-                            self.decision_level(),
-                            btlevel,
-                            learnt
-                        );
                         if !self.add_learnt(&learnt) {
                             // The learnt clause is already falsified: a
                             // level-0 contradiction derived from the original
@@ -646,7 +649,23 @@ impl CdclSolver {
 /// Returns the engine's claim plus a model (on `Sat`) or an LRAT-style proof (on
 /// `Unsat`). The result is untrusted until rechecked by [`tpt_solver_check`].
 pub fn solve_cnf(n_vars: u32, clauses: &[Vec<i32>], fuel: u64) -> SatAnswer {
-    let mut s = CdclSolver::new(n_vars, Fuel::new(fuel));
+    solve_cnf_worker(n_vars, clauses, fuel, 0, Cancel::none())
+}
+
+/// A single portfolio worker's solve: like [`solve_cnf`], but `seed`
+/// decorrelates this worker's initial branching polarity from the others
+/// racing the same problem, and `cancel` lets any of them stop this one early
+/// once a winner has been found (checked cooperatively once per search step —
+/// see [`Cancel`]). `seed == 0` with `Cancel::none()` reproduces `solve_cnf`
+/// exactly, which is how `solve_cnf` is implemented in terms of this.
+pub fn solve_cnf_worker(
+    n_vars: u32,
+    clauses: &[Vec<i32>],
+    fuel: u64,
+    seed: u64,
+    cancel: Cancel,
+) -> SatAnswer {
+    let mut s = CdclSolver::new(n_vars, Fuel::new(fuel), seed, cancel);
     for c in clauses {
         if !s.add_clause(c) {
             return SatAnswer {
@@ -677,7 +696,7 @@ pub fn solve_cnf(n_vars: u32, clauses: &[Vec<i32>], fuel: u64) -> SatAnswer {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -724,5 +743,97 @@ mod tests {
             a.result,
             SolveResult::Unknown | SolveResult::Sat | SolveResult::Unsat
         ));
+    }
+
+    #[test]
+    fn solve_cnf_agrees_with_brute_force() {
+        // Trusted oracle: exhaustive SAT check vs the CDCL engine on tiny CNFs.
+        // Catches soundness AND completeness bugs in analyse/propagate/learn.
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+        }
+        let mut rng = Lcg(0x1234_5678);
+        let brute = |n: u32, cls: &[Vec<i32>]| -> bool {
+            let total = 1u32 << n;
+            let mut a = 0u32;
+            while a < total {
+                let mut ok = true;
+                for c in cls {
+                    let mut sat = false;
+                    for &l in c {
+                        let v = l.unsigned_abs() - 1;
+                        let bit = (a >> v) & 1 == 1;
+                        let lit = if l > 0 { bit } else { !bit };
+                        if lit {
+                            sat = true;
+                            break;
+                        }
+                    }
+                    if !sat {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    return true;
+                }
+                a += 1;
+            }
+            false
+        };
+        for _ in 0..4000u32 {
+            let n = 1 + rng.below(7) as u32; // 1..7 vars
+            let nclauses = 1 + rng.below(6) as u32;
+            let mut cls: Vec<Vec<i32>> = Vec::new();
+            for _ in 0..nclauses {
+                let len = 1 + rng.below(3) as u32; // 1..3 literals
+                let mut c: Vec<i32> = Vec::new();
+                for _ in 0..len {
+                    let v = 1 + rng.below(n as u64) as i32;
+                    let sign = if rng.below(2) == 0 { 1 } else { -1 };
+                    c.push(sign * v);
+                }
+                cls.push(c);
+            }
+            let sat = brute(n, &cls);
+            let ans = solve_cnf(n, &cls, 1_000_000);
+            match (sat, ans.result) {
+                (true, SolveResult::Sat) => {
+                    // model must satisfy every clause
+                    let m = ans.model.unwrap();
+                    for c in &cls {
+                        let mut ok = false;
+                        for &l in c {
+                            let v = (l.unsigned_abs() as usize) - 1;
+                            if (l > 0 && m[v]) || (l < 0 && !m[v]) {
+                                ok = true;
+                                break;
+                            }
+                        }
+                        assert!(ok, "engine SAT model violates clause {:?} in {:?}", c, cls);
+                    }
+                }
+                (true, SolveResult::Unsat) => {
+                    panic!("engine claimed UNSAT but formula is SAT: {:?}", cls);
+                }
+                (false, SolveResult::Sat) => {
+                    panic!("engine claimed SAT but formula is UNSAT: {:?}", cls);
+                }
+                (false, SolveResult::Unsat) => {}
+                (_, SolveResult::Unknown) => {
+                    panic!("engine gave Unknown on tiny formula (bug): {:?}", cls);
+                }
+            }
+        }
     }
 }

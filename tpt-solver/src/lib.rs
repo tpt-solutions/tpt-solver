@@ -14,6 +14,7 @@ mod differential;
 mod egraph;
 pub mod parsers;
 pub mod policy;
+pub mod portfolio;
 pub mod reference;
 
 pub use tpt_solver_check as check;
