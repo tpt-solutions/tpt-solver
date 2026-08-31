@@ -226,5 +226,90 @@ Solutions.
       too-short model instead of silently zero-padding missing coordinates.
       `sat.rs`/`outcome.rs` reviewed with no issues found. Regression tests added
       for both.
-- [ ] If shared-state concurrency is ever introduced (parallel portfolio
-      solving): wire through `loom` before merging
+- [x] Parallel portfolio SAT solving, with the shared-state concurrency it
+      introduces wired through `loom` before merging, as this item long
+      required. Several diverse CDCL workers (`tpt_solver_core::sat::
+      solve_cnf_worker`, each seeded to branch differently — otherwise every
+      worker would be fully deterministic and finish in lockstep) race the
+      same CNF on OS threads (`tpt-solver/src/portfolio.rs`); the one shared
+      mutable state is a cooperative-cancellation flag
+      (`tpt_solver_core::cancel::Cancel`, an `Arc<AtomicBool>`) that every
+      worker polls once per search step, so the losers stop promptly once a
+      winner's answer is checker-`Accept`ed instead of running to their own
+      fuel exhaustion. Kept deliberately small in blast radius: `Cancel` is
+      checked from exactly one place (`CdclSolver::search`'s existing
+      per-step loop), so `Fuel` and every other theory (LRA/BV/array) are
+      untouched, and `solve_cnf`'s signature/behavior is unchanged (it is now
+      a thin wrapper over `solve_cnf_worker` with `seed=0, Cancel::none()`).
+      `tpt-solver-core/tests/loom_cancel.rs` model-checks the flag itself
+      under every thread interleaving `loom` can enumerate (a `loom`
+      CI job, mirroring the `kani` job); everything past that flag —
+      spawning threads, collecting results over `std::sync::mpsc` — is
+      ordinary message passing, no further shared mutable state to verify.
+      `policy::solve_certified_portfolio` gives the portfolio path the exact
+      same fail-closed tiered fallback (reference DPLL, then `Unknown`+dump)
+      as the sequential `solve_certified`; wired into the CLI via
+      `tpt-solver FILE.cnf --parallel N`. Covered by a differential-style
+      oracle test (`portfolio::tests::portfolio_agrees_with_brute_force`,
+      same idiom as `sat::tests::solve_cnf_agrees_with_brute_force`) trusting
+      only `Accept`ed portfolio claims against exhaustive enumeration.
+
+## Phase 6 — Security audit follow-ups, CI hardening, adoption tooling (2026-08-31)
+
+Triggered by a full project review (stub/TODO sweep, security audit, tooling/adoption
+audit). The stub/TODO sweep found nothing to fix (Phases 0–5 above are complete
+modulo the infra-blocked benchmark item); this phase tracks what the security and
+tooling audits did find. All items below are done.
+
+- [x] Fixed panic-on-overflow in `sub_vec` (`tpt-solver/src/parsers/smtlib2.rs`):
+      replaced `.expect("sub_vec: overflow")` with the same `SmtError::BadNumber`
+      propagation already used by every other overflow site in the file. Was
+      reachable from untrusted `.smt2` input via `mk_cmp`'s LRA constraint
+      lowering. Regression test: `sub_vec_overflow_is_a_bad_number_error_not_a_panic`.
+- [x] Capped SMT-LIB2 s-expression nesting depth in `parse_sexps`
+      (`tpt-solver/src/parsers/smtlib2.rs`, `MAX_SEXP_DEPTH = 512`) with a new
+      `SmtError::TooDeep` variant, closing an unbounded-recursion stack-overflow
+      DoS on crafted deeply-nested `.smt2` input. A single depth check in this one
+      choke point transitively bounds every downstream recursive walk
+      (`sexp_to_term`, `linear`, `collect_constraints`, `Encoder::encode`,
+      `bv_term`, `ax_side`); DIMACS/MPS parsers are unaffected (line/token-based).
+      Regression test: `deeply_nested_sexp_errors_instead_of_overflowing_the_stack`;
+      corpus seed added at `fuzz/corpus/smtlib2/deep_nesting`.
+- [x] Added `deny.toml` + an advisory (non-blocking, `continue-on-error`)
+      `cargo-deny` CI job for RUSTSEC advisories/license policy.
+- [x] Added a `fuzz-smoke-test` CI job running the existing `dimacs`/`mps`/
+      `smtlib2` fuzz targets for 60s each on a nightly toolchain.
+- [x] Added an `msrv` CI job pinning `rust-toolchain@1.85` (matches the declared
+      `rust-version` in the workspace `Cargo.toml`, previously unverified).
+- [x] Adopted `clap` (derive) for the CLI (`tpt-solver/src/main.rs`), replacing the
+      hand-rolled arg loop; gets `--help`/`--version` plus the two new flags below.
+      Only touches the periphery crate; `tpt-solver-core`/`tpt-solver-check` stay
+      dependency-free.
+- [x] Expanded `README.md` with "Installing" and "CLI usage" sections and refreshed
+      the stale "Status" section (previously said only Phase 0–1 were done).
+- [x] Added `tpt-solver/examples/lib_usage.rs` demonstrating `tpt-solver-core`/
+      `tpt-solver` used as a library (in-memory SAT + LRA problems), runnable via
+      `cargo run --example lib_usage`.
+- [x] Added `rust-toolchain.toml` pinning 1.85 (the MSRV) for local dev builds.
+- [x] Added `.github/workflows/release.yml`: tag-triggered (`v*`) build of
+      `tpt-solver` binaries for linux/macOS/windows, attached to a GitHub Release.
+- [x] `--emit-proof FILE`: added `check_cdcl_answer_with_proof` /
+      `solve_and_check_cdcl_with_proof` / `solve_and_check_lra_with_cert` in
+      `tpt-solver/src/reference.rs`, exposing the `LratProof`/`FarkasCertificate`
+      that were already being built and discarded. The CLI dumps a DRAT-style
+      clause list for CNF/DIMACS UNSAT, or `(index multiplier)` pairs for LRA
+      UNSAT (SMT-LIB2/MPS). Not yet wired for QF_BV/QF_AX or `--parallel`.
+- [x] `--explain`: LRA-only UNSAT core (SMT-LIB2/MPS) — projects the Farkas
+      certificate's nonzero-multiplier constraints back onto the original
+      constraint list; no new algorithm needed. A CNF/SAT UNSAT core needs real
+      engine-level clause-provenance tracking (RUP hints aren't populated yet) and
+      remains out of scope.
+
+Also found in passing (not fixed — pre-existing, unrelated to this phase's scope,
+and not part of the working tree's own uncommitted in-progress edits): `cargo
+clippy --workspace --all-targets -- -D warnings` (the exact command the
+`build-and-test` CI job runs) currently fails on `tpt-solver-core/src/array.rs`,
+`tpt-solver-check/src/array.rs`, `tpt-solver/src/egraph.rs`, and
+`tpt-solver/src/parsers/mps.rs` (`comparison_chain`, `manual_strip`,
+`redundant_closure` ×2, `map_entry`). None of these files were touched by this
+phase's changes.

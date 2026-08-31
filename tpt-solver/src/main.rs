@@ -2,85 +2,118 @@
 //!
 //! Usage:
 //! ```text
-//! tpt-solver                 # run built-in demo (reference + CDCL, both certified)
-//! tpt-solver FILE.cnf        # parse a DIMACS CNF, solve with CDCL, certify answer
-//! tpt-solver FILE.smt2       # parse an SMT-LIB2 script, solve (LRA or SAT), certify
-//! tpt-solver FILE.mps        # parse a free-format LP-MPS file, solve the LRA
-//!                             # feasibility system (no objective optimization), certify
+//! tpt-solver                          # run built-in demo (reference + CDCL, both certified)
+//! tpt-solver FILE.cnf                  # parse a DIMACS CNF, solve with CDCL, certify answer
+//! tpt-solver FILE.smt2                 # parse an SMT-LIB2 script, solve (LRA or SAT), certify
+//! tpt-solver FILE.mps                  # parse a free-format LP-MPS file, solve the LRA
+//!                                       # feasibility system (no objective optimization), certify
 //! tpt-solver FILE.cnf --fuel N
-//! tpt-solver FILE.cnf --parallel N   # race N diverse CDCL workers (DIMACS only)
+//! tpt-solver FILE.cnf --parallel N     # race N diverse CDCL workers (DIMACS only)
+//! tpt-solver FILE.cnf --emit-proof P   # on UNSAT, dump the checked certificate to file P
+//! tpt-solver FILE.smt2 --explain       # on UNSAT (LRA only), print the implicated constraints
+//! tpt-solver --bench                   # local 3-SAT performance ladder
 //! ```
 //!
 //! Every answer is revalidated by the trusted checker (`tpt-solver-check`); the
-//! printed verdict is what may actually be trusted. A richer CLI (`clap`) arrives
-//! in a later phase.
+//! printed verdict is what may actually be trusted.
 
+use clap::Parser;
 use tpt_solver::parsers::dimacs::parse_dimacs;
 use tpt_solver::parsers::mps::parse_mps;
 use tpt_solver::parsers::smtlib2::{parse_script, LraProblem, SmtError};
 use tpt_solver::policy::solve_certified_portfolio;
 use tpt_solver::reference::{
     solve_and_check, solve_and_check_arrays, solve_and_check_bv, solve_and_check_cdcl,
-    solve_and_check_lra, Problem,
+    solve_and_check_cdcl_with_proof, solve_and_check_lra_with_cert, Problem,
 };
 use tpt_solver_check::outcome::Outcome;
 use tpt_solver_core::engine::SolveResult;
+use tpt_solver_core::lra::{FarkasCertificate, LinConstraint};
+
+/// tpt-solver: a certificate-architecture SAT/SMT solver suite.
+///
+/// Every answer this CLI prints is revalidated by the independent trusted checker
+/// (`tpt-solver-check`) before being reported; run with no arguments for a built-in
+/// demo of that pipeline.
+#[derive(Parser)]
+#[command(name = "tpt-solver", version, about, long_about = None)]
+struct Cli {
+    /// Input file: .cnf (DIMACS), .smt2/.smt (SMT-LIB2), or .mps (LP-MPS).
+    /// Omit to run the built-in demo.
+    path: Option<String>,
+
+    /// Step budget for the engine before giving up with `Unknown`.
+    #[arg(long, default_value_t = 10_000_000)]
+    fuel: u64,
+
+    /// Race N diverse CDCL workers instead of a single solve (DIMACS only).
+    #[arg(long, value_name = "N")]
+    parallel: Option<usize>,
+
+    /// Run the local 3-SAT performance ladder instead of solving a file.
+    #[arg(long)]
+    bench: bool,
+
+    /// On an UNSAT claim, write the checked certificate to FILE: an LRAT-style
+    /// clause dump for DIMACS/CNF, or the Farkas multipliers for SMT-LIB2/MPS LRA.
+    #[arg(long, value_name = "FILE")]
+    emit_proof: Option<String>,
+
+    /// On an UNSAT claim, print the minimal core of original constraints
+    /// implicated in the contradiction. LRA only in this release (SMT-LIB2/MPS);
+    /// a DIMACS/CNF UNSAT core needs clause-provenance tracking not yet wired in.
+    #[arg(long)]
+    explain: bool,
+}
+
+/// Options threaded through every `run_*` function for a single file solve.
+struct RunOpts {
+    fuel: u64,
+    parallel: Option<usize>,
+    emit_proof: Option<String>,
+    explain: bool,
+}
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let mut path: Option<&str> = None;
-    let mut fuel: u64 = 10_000_000;
-    let mut parallel: Option<usize> = None;
-
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--fuel" => {
-                if let Some(next) = args.get(i + 1) {
-                    if let Ok(f) = next.parse() {
-                        fuel = f;
-                    }
-                }
-                i += 2;
-            }
-            "--parallel" => {
-                if let Some(next) = args.get(i + 1) {
-                    if let Ok(n) = next.parse() {
-                        parallel = Some(n);
-                    }
-                }
-                i += 2;
-            }
-            "--bench" => {
-                run_bench();
-                return;
-            }
-            other => {
-                if path.is_none() && !other.starts_with('-') {
-                    path = Some(other);
-                }
-                i += 1;
-            }
-        }
+    let cli = Cli::parse();
+    if cli.bench {
+        run_bench();
+        return;
     }
-
-    match path {
-        Some(p) => run_file(p, fuel, parallel),
+    let opts = RunOpts {
+        fuel: cli.fuel,
+        parallel: cli.parallel,
+        emit_proof: cli.emit_proof,
+        explain: cli.explain,
+    };
+    match cli.path {
+        Some(p) => run_file(&p, &opts),
         None => run_demo(),
     }
 }
 
-fn run_file(path: &str, fuel: u64, parallel: Option<usize>) {
+fn run_file(path: &str, opts: &RunOpts) {
     if path.ends_with(".smt2") || path.ends_with(".smt") {
-        return run_smtlib2(path, fuel);
+        return run_smtlib2(path, opts);
     }
     if path.ends_with(".mps") {
-        return run_mps(path, fuel);
+        return run_mps(path, opts);
     }
-    run_dimacs(path, fuel, parallel);
+    run_dimacs(path, opts);
 }
 
-fn run_mps(path: &str, fuel: u64) {
+/// Report the certificate/explain output for an LRA UNSAT claim, shared by the
+/// SMT-LIB2 and MPS front ends (both lower to the same `LinConstraint` system).
+fn report_lra_unsat(cert: &FarkasCertificate, constraints: &[LinConstraint], opts: &RunOpts) {
+    if let Some(path) = &opts.emit_proof {
+        write_farkas_cert(path, cert);
+    }
+    if opts.explain {
+        print_lra_explain(cert, constraints);
+    }
+}
+
+fn run_mps(path: &str, opts: &RunOpts) {
     let input = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -100,7 +133,7 @@ fn run_mps(path: &str, fuel: u64) {
         prob.var_count(),
         prob.constraints.len()
     );
-    let (claim, verdict) = solve_and_check_lra(&prob.constraints, fuel);
+    let (claim, verdict, cert) = solve_and_check_lra_with_cert(&prob.constraints, opts.fuel);
     print_verdict("LRA engine", claim, verdict);
     if claim == SolveResult::Sat {
         let model = extract_lra_model(&prob.constraints);
@@ -108,10 +141,12 @@ fn run_mps(path: &str, fuel: u64) {
             "model: {:?}",
             prob.vars.iter().zip(&model).collect::<Vec<_>>()
         );
+    } else if let Some(cert) = &cert {
+        report_lra_unsat(cert, &prob.constraints, opts);
     }
 }
 
-fn run_dimacs(path: &str, fuel: u64) {
+fn run_dimacs(path: &str, opts: &RunOpts) {
     let input = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -132,11 +167,34 @@ fn run_dimacs(path: &str, fuel: u64) {
         problem.clauses.len()
     );
 
-    let (claim, verdict) = solve_and_check_cdcl(&problem, fuel);
-    print_verdict("CDCL engine", claim, verdict);
+    let claim = match opts.parallel {
+        Some(workers) => {
+            println!("solving with {} racing portfolio workers", workers.max(1));
+            let (claim, verdict, dump) = solve_certified_portfolio(&problem, opts.fuel, workers);
+            if let Some(d) = dump {
+                println!("{}", d.render());
+            }
+            print_verdict("CDCL engine (portfolio)", claim, verdict);
+            if opts.emit_proof.is_some() {
+                eprintln!("note: --emit-proof is not supported with --parallel; re-run without --parallel to export a certificate");
+            }
+            claim
+        }
+        None => {
+            let (claim, verdict, proof) = solve_and_check_cdcl_with_proof(&problem, opts.fuel);
+            print_verdict("CDCL engine", claim, verdict);
+            if let (Some(path), Some(proof)) = (&opts.emit_proof, &proof) {
+                write_lrat_proof(path, proof);
+            }
+            if opts.explain && claim == SolveResult::Unsat {
+                println!("note: --explain is LRA-only in this release; no CNF/SAT UNSAT core is available");
+            }
+            claim
+        }
+    };
 
     if claim == SolveResult::Sat {
-        if let Some(model) = solve_model(&problem, fuel) {
+        if let Some(model) = solve_model(&problem, opts.fuel) {
             println!(
                 "model (x1..x10 shown): {:?}",
                 &model[..core::cmp::min(10, model.len())]
@@ -145,7 +203,7 @@ fn run_dimacs(path: &str, fuel: u64) {
     }
 }
 
-fn run_smtlib2(path: &str, fuel: u64) {
+fn run_smtlib2(path: &str, opts: &RunOpts) {
     let input = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -171,7 +229,8 @@ fn run_smtlib2(path: &str, fuel: u64) {
     match script.to_lra() {
         Ok(prob) => {
             println!("lowering: QF_LRA ({} vars)", prob.var_count());
-            let (claim, verdict) = solve_and_check_lra(&prob.constraints, fuel);
+            let (claim, verdict, cert) =
+                solve_and_check_lra_with_cert(&prob.constraints, opts.fuel);
             print_verdict("LRA engine", claim, verdict);
             if claim == SolveResult::Sat {
                 let model = extract_lra_model(&prob.constraints);
@@ -179,6 +238,8 @@ fn run_smtlib2(path: &str, fuel: u64) {
                     "model: {:?}",
                     prob.vars.iter().zip(&model).collect::<Vec<_>>()
                 );
+            } else if let Some(cert) = &cert {
+                report_lra_unsat(cert, &prob.constraints, opts);
             }
             return;
         }
@@ -194,18 +255,20 @@ fn run_smtlib2(path: &str, fuel: u64) {
     match script.to_bv() {
         Ok(prob) => {
             println!("lowering: QF_BV ({} vars)", prob.names.len());
-            let (claim, verdict) = solve_and_check_bv(prob.var_count, &prob.assertions, fuel);
+            let (claim, verdict) = solve_and_check_bv(prob.var_count, &prob.assertions, opts.fuel);
             print_verdict("BV engine", claim, verdict);
             if claim == SolveResult::Sat {
                 // Deterministic engine: re-solving yields the same model.
                 if let Some(tpt_solver_core::bv::BvOutcome::Sat(model)) =
-                    tpt_solver_core::bv::solve_bv(prob.var_count, &prob.assertions, fuel)
+                    tpt_solver_core::bv::solve_bv(prob.var_count, &prob.assertions, opts.fuel)
                 {
                     println!(
                         "model: {:?}",
                         prob.names.iter().zip(&model.values).collect::<Vec<_>>()
                     );
                 }
+            } else if opts.emit_proof.is_some() || opts.explain {
+                println!("note: --emit-proof/--explain are not yet supported for QF_BV");
             }
             return;
         }
@@ -229,9 +292,12 @@ fn run_smtlib2(path: &str, fuel: u64) {
                 prob.avars.len() as u32,
                 prob.evars.len() as u32,
                 &prob.assertions,
-                fuel,
+                opts.fuel,
             );
             print_verdict("AX engine", claim, verdict);
+            if claim == SolveResult::Unsat && (opts.emit_proof.is_some() || opts.explain) {
+                println!("note: --emit-proof/--explain are not yet supported for QF_AX");
+            }
             return;
         }
         Err(SmtError::Unsupported(_)) => {
@@ -258,8 +324,74 @@ fn run_smtlib2(path: &str, fuel: u64) {
         problem.var_count,
         problem.clauses.len()
     );
-    let (claim, verdict) = solve_and_check_cdcl(&problem, fuel);
+    let (claim, verdict, proof) = solve_and_check_cdcl_with_proof(&problem, opts.fuel);
     print_verdict("CDCL engine", claim, verdict);
+    if let (Some(path), Some(proof)) = (&opts.emit_proof, &proof) {
+        write_lrat_proof(path, proof);
+    }
+    if opts.explain && claim == SolveResult::Unsat {
+        println!("note: --explain is LRA-only in this release; no CNF/SAT UNSAT core is available");
+    }
+}
+
+/// Dump a checked [`tpt_solver_check::lrat::LratProof`] as a DRAT-style clause
+/// list (one derived clause per line, `0`-terminated, empty line for the final
+/// empty clause) so external tools (e.g. `drat-trim`) can independently
+/// re-verify the UNSAT claim. Full LRAT hints are not populated by the engine
+/// yet, so this is the plain-RUP subset of the format.
+fn write_lrat_proof(path: &str, proof: &tpt_solver_check::lrat::LratProof) {
+    let mut out = String::new();
+    for step in proof.steps() {
+        for lit in &step.clause {
+            let n = lit.var().get() as i64;
+            out.push_str(&(if lit.is_positive() { n } else { -n }).to_string());
+            out.push(' ');
+        }
+        out.push_str("0\n");
+    }
+    match std::fs::write(path, out) {
+        Ok(()) => println!(
+            "proof written to '{}' ({} step(s))",
+            path,
+            proof.steps().len()
+        ),
+        Err(e) => eprintln!("warning: failed to write proof to '{}': {}", path, e),
+    }
+}
+
+/// Dump a checked [`FarkasCertificate`] as one `index multiplier` line per
+/// original constraint (only nonzero multipliers are listed), so the
+/// contradiction `sum(multiplier_i * constraint_i) => 0 <= negative` can be
+/// independently re-derived.
+fn write_farkas_cert(path: &str, cert: &FarkasCertificate) {
+    let mut out = String::from("# Farkas certificate: nonzero (index multiplier) pairs\n");
+    for (i, m) in cert.multipliers.iter().enumerate() {
+        if !m.is_zero() {
+            out.push_str(&format!("{} {:?}\n", i, m));
+        }
+    }
+    match std::fs::write(path, out) {
+        Ok(()) => println!("proof written to '{}'", path),
+        Err(e) => eprintln!("warning: failed to write proof to '{}': {}", path, e),
+    }
+}
+
+/// Print the LRA UNSAT core: the original constraints with a nonzero Farkas
+/// multiplier, i.e. exactly those that participate in the contradiction.
+fn print_lra_explain(cert: &FarkasCertificate, constraints: &[LinConstraint]) {
+    let core: Vec<usize> = cert
+        .multipliers
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| !m.is_zero())
+        .map(|(i, _)| i)
+        .collect();
+    println!(
+        "explain: UNSAT core is {} of {} constraint(s): {:?}",
+        core.len(),
+        constraints.len(),
+        core
+    );
 }
 
 /// Best-effort extraction of an LRA model for display (re-uses the core's Simplex).

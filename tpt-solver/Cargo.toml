@@ -7,6 +7,20 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Periphery for the tpt-solver suite: parsers, CLI, e-graph preprocessing, and integration glue"
+readme = "README.md"
+changelog = "CHANGELOG.md"
+keywords = [
+    "sat",
+    "smt",
+    "solver",
+    "cli",
+    "parsing",
+]
+categories = [
+    "command-line-utilities",
+    "algorithms",
+    "parsing",
+]
 
 [lib]
 name = "tpt_solver"
@@ -19,8 +33,9 @@ path = "src/main.rs"
 [dependencies]
 tpt-solver-core = { path = "../tpt-solver-core" }
 tpt-solver-check = { path = "../tpt-solver-check" }
-# E-graph equality saturation for Boolean-formula preprocessing (spec §4.3, §7).
-egg = "0.11"
+# Boolean-formula preprocessing uses a small, dependency-free in-house e-graph
+# (see `src/egraph.rs`) instead of the external `egg` crate (spec §4.3, §7).
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 # Truth-table equivalence checking of the e-graph simplification pass.

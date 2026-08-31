@@ -7,6 +7,20 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "The small, independently-checkable trusted kernel for the tpt-solver suite (LRAT/Farkas/model recheck)"
+readme = "README.md"
+changelog = "CHANGELOG.md"
+keywords = [
+    "sat",
+    "smt",
+    "certificate",
+    "verification",
+    "formal-verification",
+]
+categories = [
+    "algorithms",
+    "mathematics",
+    "science",
+]
 
 [dependencies]
 tpt-solver-core = { path = "../tpt-solver-core" }

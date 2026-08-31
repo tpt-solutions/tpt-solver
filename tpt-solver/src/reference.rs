@@ -16,7 +16,7 @@ use tpt_solver_check::outcome::Outcome;
 use tpt_solver_check::sat::{check_model, Cnf, Model};
 use tpt_solver_core::engine::SolveResult;
 use tpt_solver_core::ir::{Lit, VarId};
-use tpt_solver_core::lra::{fourier_motzkin, FmResult, LinConstraint};
+use tpt_solver_core::lra::{fourier_motzkin, FarkasCertificate, FmResult, LinConstraint};
 use tpt_solver_core::sat::SatAnswer;
 
 /// A formula in simple (non-branded) CNF: each literal is `var` (positive) or `-var`
@@ -260,6 +260,43 @@ pub fn solve_and_check_cdcl(problem: &Problem, fuel: u64) -> (SolveResult, Outco
     check_cdcl_answer(problem, ans)
 }
 
+/// Like [`check_cdcl_answer`], but also hands back the checked [`LratProof`] on an
+/// UNSAT claim (`None` for SAT/Unknown) — used by `--emit-proof` so the exact
+/// certificate the kernel just validated can be dumped for external re-verification.
+pub fn check_cdcl_answer_with_proof(
+    problem: &Problem,
+    ans: SatAnswer,
+) -> (SolveResult, Outcome, Option<LratProof>) {
+    if ans.result != SolveResult::Unsat {
+        let (claim, verdict) = check_cdcl_answer(problem, ans);
+        return (claim, verdict, None);
+    }
+    let steps: Vec<LratStep> = ans
+        .proof
+        .iter()
+        .map(|cl| LratStep {
+            clause: cl
+                .iter()
+                .filter_map(|&l| VarId::new(l.unsigned_abs()).map(|v| Lit::new(v, l > 0)))
+                .collect(),
+            hints: Vec::new(),
+        })
+        .collect();
+    let proof = LratProof::new(steps);
+    let cnf = problem.as_cnf();
+    let verdict = check_proof(cnf.clauses(), &proof, problem.var_count);
+    (SolveResult::Unsat, verdict, Some(proof))
+}
+
+/// Like [`solve_and_check_cdcl`], but also returns the [`LratProof`] on UNSAT.
+pub fn solve_and_check_cdcl_with_proof(
+    problem: &Problem,
+    fuel: u64,
+) -> (SolveResult, Outcome, Option<LratProof>) {
+    let ans = tpt_solver_core::sat::solve_cnf(problem.var_count, &problem.clauses, fuel);
+    check_cdcl_answer_with_proof(problem, ans)
+}
+
 /// Solve a QF_LRA problem: Fourier–Motzkin decides feasibility and emits a Farkas
 /// certificate on UNSAT, while a Simplex pass extracts a model on SAT. Both answers
 /// are validated through the trusted kernel.
@@ -284,6 +321,28 @@ pub fn solve_and_check_lra(constraints: &[LinConstraint], _fuel: u64) -> (SolveR
             None => (SolveResult::Unknown, Outcome::Inconclusive),
         },
         None => (SolveResult::Unknown, Outcome::Inconclusive),
+    }
+}
+
+/// Like [`solve_and_check_lra`], but also returns the [`FarkasCertificate`] on
+/// UNSAT (`None` for SAT/Unknown) — used by `--emit-proof` and `--explain`. The
+/// certificate's `multipliers`, aligned with `constraints`, are exactly the data
+/// `--explain` projects onto an UNSAT core: any constraint with a nonzero
+/// multiplier participates in the contradiction.
+pub fn solve_and_check_lra_with_cert(
+    constraints: &[LinConstraint],
+    fuel: u64,
+) -> (SolveResult, Outcome, Option<FarkasCertificate>) {
+    match fourier_motzkin(constraints) {
+        Some(FmResult::Unsat(cert)) => {
+            let verdict = check_farkas(constraints, &cert);
+            (SolveResult::Unsat, verdict, Some(cert))
+        }
+        Some(FmResult::Sat) => {
+            let (claim, verdict) = solve_and_check_lra(constraints, fuel);
+            (claim, verdict, None)
+        }
+        None => (SolveResult::Unknown, Outcome::Inconclusive, None),
     }
 }
 

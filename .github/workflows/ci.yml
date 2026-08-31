@@ -54,3 +54,60 @@ jobs:
         # `cargo kani` provides the `kani` crate and sets `cfg(kani)`; no Cargo
         # dependency or feature flag is required.
         run: cargo kani -p tpt-solver-core
+
+  loom:
+    name: Loom (portfolio cancellation flag)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Model-check cancel::Cancel under every thread interleaving
+        # `cancel::Cancel` (tpt-solver-core/src/cancel.rs) is the one piece of
+        # shared-state concurrency the suite introduces, for racing portfolio
+        # SAT workers (tpt-solver/src/portfolio.rs). The `loom` feature swaps
+        # in loom's shadow Arc/AtomicBool; `--cfg loom` is required for loom's
+        # own instrumentation to activate.
+        run: RUSTFLAGS="--cfg loom" cargo test -p tpt-solver-core --release --features loom --test loom_cancel -- --test-threads=1
+
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - name: cargo check on the declared MSRV
+        run: cargo check --workspace
+
+  cargo-deny:
+    name: cargo-deny (advisories, licenses, bans)
+    runs-on: ubuntu-latest
+    # Advisory only: reports RUSTSEC advisories, license policy, and duplicate/
+    # wildcard dependency issues without failing the build. A new advisory landing
+    # upstream shouldn't block unrelated PRs; tighten to blocking once this has run
+    # clean for a while.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: cargo deny check
+        run: cargo deny check
+
+  fuzz-smoke-test:
+    name: Fuzz smoke test (dimacs, mps, smtlib2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz each target for 60s
+        # Short timed runs, not a full fuzzing campaign: enough to catch an
+        # immediate regression (e.g. the parser panics/stack overflows fixed in
+        # Phase 6) on every PR, while a real fuzzing campaign stays a manual
+        # `cargo fuzz run <target>` outside CI.
+        run: |
+          for target in dimacs mps smtlib2; do
+            cargo fuzz run "$target" -- -max_total_time=60
+          done

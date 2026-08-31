@@ -3,6 +3,19 @@ name = "tpt-solver-fuzz"
 version = "0.0.0"
 edition = "2021"
 publish = false
+readme = "README.md"
+changelog = "CHANGELOG.md"
+keywords = [
+    "fuzzing",
+    "sat",
+    "smt",
+    "testing",
+    "differential-testing",
+]
+categories = [
+    "development-tools",
+    "algorithms",
+]
 
 [package.metadata]
 cargo-fuzz = true

@@ -7,6 +7,20 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Untrusted but high-performance solving engine (CDCL, DPLL(T), Simplex) for the tpt-solver suite"
+readme = "README.md"
+changelog = "CHANGELOG.md"
+keywords = [
+    "sat",
+    "smt",
+    "solver",
+    "constraint-satisfaction",
+    "linear-programming",
+]
+categories = [
+    "algorithms",
+    "mathematics",
+    "science",
+]
 
 [dependencies]
 # Model-checks every thread interleaving of `cancel::Cancel`'s shared flag

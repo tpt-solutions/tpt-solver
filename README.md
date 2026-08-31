@@ -34,9 +34,8 @@ proofs, checked by tools like `drat-trim` and the machine-verified `cake_lpr`).
 
 ## Status
 
-Phase 0 (project setup) and the Phase 1 foundation (IR newtypes with session tagging,
-typestate lifecycle, arena/trail memory, fuel system, RUP checker, reference solver)
-are in place. See `todo.md` for the full phased plan.
+Phases 0–5 (SAT/LRA/BV/array theories, certificate checking, parsers, portfolio
+solving) are complete; see `todo.md` for the full phased plan and what's left.
 
 ## Building and testing
 
@@ -44,6 +43,39 @@ are in place. See `todo.md` for the full phased plan.
 cargo build --workspace
 cargo test  --workspace
 ```
+
+## Installing
+
+```sh
+cargo install --path tpt-solver
+```
+
+This builds the `tpt-solver` binary from source (no crates.io publish yet, no
+prebuilt release binaries other than what the `release` GitHub Actions workflow
+attaches to tagged releases).
+
+## CLI usage
+
+```sh
+tpt-solver                          # run built-in demo (reference + CDCL, both certified)
+tpt-solver FILE.cnf                 # parse a DIMACS CNF, solve with CDCL, certify answer
+tpt-solver FILE.smt2                # parse an SMT-LIB2 script, solve (LRA or SAT), certify
+tpt-solver FILE.mps                 # parse a free-format LP-MPS file, solve the LRA
+                                     # feasibility system (no objective optimization), certify
+tpt-solver FILE.cnf --fuel N        # step budget before giving up with `Unknown`
+tpt-solver FILE.cnf --parallel N    # race N diverse CDCL workers (DIMACS only)
+tpt-solver FILE.cnf --emit-proof P  # on UNSAT, dump the checked certificate to file P
+tpt-solver FILE.smt2 --explain      # on UNSAT (LRA only), print the implicated constraints
+tpt-solver --bench                  # local 3-SAT performance ladder
+```
+
+Every printed verdict is what the trusted checker (`tpt-solver-check`) actually
+accepted, not just what the engine claimed — run `tpt-solver --help` for the full
+flag reference.
+
+For using the crates as a library instead of through the CLI, see
+[`tpt-solver/examples/lib_usage.rs`](tpt-solver/examples/lib_usage.rs) (run with
+`cargo run --example lib_usage`).
 
 ## License
 

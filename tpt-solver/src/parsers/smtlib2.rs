@@ -61,6 +61,8 @@ pub enum SmtError {
     BadNumber(String),
     /// The script contained no `assert` commands.
     NoAsserts,
+    /// The input's s-expression nesting exceeded the parser's depth limit.
+    TooDeep,
 }
 
 impl fmt::Display for SmtError {
@@ -71,6 +73,7 @@ impl fmt::Display for SmtError {
             SmtError::BadArity(s) => write!(f, "SMT-LIB2 bad arity: {}", s),
             SmtError::BadNumber(s) => write!(f, "SMT-LIB2 bad number: {}", s),
             SmtError::NoAsserts => write!(f, "SMT-LIB2: no asserted formulas"),
+            SmtError::TooDeep => write!(f, "SMT-LIB2 parse error: nesting too deep"),
         }
     }
 }
@@ -142,14 +145,27 @@ enum Sexp {
     List(Vec<Sexp>),
 }
 
-fn parse_sexps(toks: &[Tok], pos: &mut usize) -> Result<Vec<Sexp>, SmtError> {
+/// Maximum s-expression nesting depth accepted by [`parse_sexps`].
+///
+/// Every downstream recursive walk (`sexp_to_term`, `linear`, `collect_constraints`,
+/// `Encoder::encode`, `bv_term`, `ax_side`, ...) recurses over the `Sexp` tree this
+/// function builds, so capping depth here transitively bounds all of them without
+/// needing a depth parameter threaded through each one individually. 512 is deep
+/// enough for any realistic script while staying well clear of a stack overflow even
+/// on a reduced-size thread stack.
+const MAX_SEXP_DEPTH: u32 = 512;
+
+fn parse_sexps(toks: &[Tok], pos: &mut usize, depth: u32) -> Result<Vec<Sexp>, SmtError> {
+    if depth > MAX_SEXP_DEPTH {
+        return Err(SmtError::TooDeep);
+    }
     let mut out = Vec::new();
     while *pos < toks.len() {
         match &toks[*pos] {
             Tok::RParen => break,
             Tok::LParen => {
                 *pos += 1;
-                let list = parse_sexps(toks, pos)?;
+                let list = parse_sexps(toks, pos, depth + 1)?;
                 // Consume the matching ')'.
                 if *pos >= toks.len() || !matches!(toks[*pos], Tok::RParen) {
                     return Err(SmtError::Parse("unbalanced '('".into()));
@@ -748,8 +764,8 @@ fn mk_cmp(
     pc.resize(n, Rational::zero());
     qc.resize(n, Rational::zero());
     let coeffs = match dir {
-        CmpDir::Le => sub_vec(&pc, &qc),
-        CmpDir::Ge => sub_vec(&qc, &pc),
+        CmpDir::Le => sub_vec(&pc, &qc)?,
+        CmpDir::Ge => sub_vec(&qc, &pc)?,
     };
     let rhs = match dir {
         CmpDir::Le => q
@@ -910,15 +926,18 @@ fn linear(term: &Term, ctx: &mut LraCtx) -> Result<Linear, SmtError> {
     }
 }
 
-fn sub_vec(a: &[Rational], b: &[Rational]) -> Vec<Rational> {
+fn sub_vec(a: &[Rational], b: &[Rational]) -> Result<Vec<Rational>, SmtError> {
     let n = a.len().max(b.len());
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let x = a.get(i).copied().unwrap_or_else(Rational::zero);
         let y = b.get(i).copied().unwrap_or_else(Rational::zero);
-        out.push(x.add(y.neg()).expect("sub_vec: overflow"));
+        out.push(
+            x.add(y.neg())
+                .ok_or_else(|| SmtError::BadNumber("arithmetic overflow".into()))?,
+        );
     }
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1151,7 +1170,7 @@ impl Encoder {
 pub fn parse_script(input: &str) -> Result<Script, SmtError> {
     let toks = tokenize(input)?;
     let mut pos = 0;
-    let sexps = parse_sexps(&toks, &mut pos)?;
+    let sexps = parse_sexps(&toks, &mut pos, 0)?;
     if pos != toks.len() {
         return Err(SmtError::Parse("unexpected ')'".into()));
     }
@@ -1594,6 +1613,28 @@ mod tests {
         // x >= 1 => -x <= -1 ; x <= 0 => x <= 0
         assert_eq!(prob.constraints.len(), 2);
         assert_eq!(prob.vars, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn deeply_nested_sexp_errors_instead_of_overflowing_the_stack() {
+        let n = (MAX_SEXP_DEPTH as usize) + 16;
+        let src = format!("(set-logic QF_LRA){}assert{}", "(".repeat(n), ")".repeat(n));
+        match parse_script(&src) {
+            Err(SmtError::TooDeep) => {}
+            other => panic!("expected SmtError::TooDeep, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sub_vec_overflow_is_a_bad_number_error_not_a_panic() {
+        // `Rational` is `i128`-backed; push its numerator right up against the
+        // boundary so `x - y` (i.e. `x.add(y.neg())`) overflows.
+        let near_max = Rational::new(i128::MAX, 1).unwrap();
+        let neg_one = Rational::new(-1, 1).unwrap();
+        match sub_vec(&[near_max], &[neg_one]) {
+            Err(SmtError::BadNumber(_)) => {}
+            other => panic!("expected SmtError::BadNumber, got {:?}", other),
+        }
     }
 
     #[test]
