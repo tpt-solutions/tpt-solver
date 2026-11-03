@@ -45,13 +45,20 @@ jobs:
   kani:
     name: Kani proofs
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Kani
-        # The repo's rust-toolchain.toml pins 1.85, which would build kani-verifier
-        # too (its dependency `home` needs rustc 1.88). `+stable` overrides the file.
-        run: cargo +stable install --locked kani-verifier && cargo kani setup
+        # Prebuilt kani-verifier binary: building it from source with `cargo install`
+        # took most of the job's time. The repo's rust-toolchain.toml pins 1.85,
+        # which the prebuilt binary doesn't need, but `cargo kani setup` still
+        # downloads the CBMC bundle.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: kani-verifier
+      - name: Set up Kani
+        run: cargo kani setup
       - name: Run Kani harnesses (core)
         # `cargo kani` provides the `kani` crate and sets `cfg(kani)`; no Cargo
         # dependency or feature flag is required.
@@ -102,20 +109,25 @@ jobs:
   fuzz-smoke-test:
     name: Fuzz smoke test (dimacs, mps, smtlib2)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-fuzz
-        # The repo's rust-toolchain.toml pins 1.85, which rustup applies over the
-        # nightly default set above, and cargo-fuzz's dependencies need a newer
-        # rustc than 1.85. `+nightly` overrides the file.
-        run: cargo +nightly install cargo-fuzz --locked
+        # Prebuilt binary rather than `cargo install`, which compiled from source on
+        # every run. The repo's rust-toolchain.toml pins 1.85, which rustup applies
+        # over the nightly default set above; `+nightly` overrides the file.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
       - name: Fuzz each target for 60s
         # Short timed runs, not a full fuzzing campaign: enough to catch an
         # immediate regression (e.g. the parser panics/stack overflows fixed in
         # Phase 6) on every PR, while a real fuzzing campaign stays a manual
         # `cargo +nightly fuzz run <target>` outside CI.
+        # `-timeout=10` caps a single hanging input; libFuzzer's default is 1200s,
+        # and `-max_total_time` alone doesn't stop a run stuck on one input.
         run: |
           for target in dimacs mps smtlib2; do
-            cargo +nightly fuzz run "$target" -- -max_total_time=60
+            cargo +nightly fuzz run "$target" -- -max_total_time=60 -timeout=10
           done
