@@ -267,7 +267,7 @@ fn run_smtlib2(path: &str, opts: &RunOpts) {
                         prob.names.iter().zip(&model.values).collect::<Vec<_>>()
                     );
                 }
-            } else if opts.emit_proof.is_some() || opts.explain {
+            } else if claim == SolveResult::Unsat && (opts.emit_proof.is_some() || opts.explain) {
                 println!("note: --emit-proof/--explain are not yet supported for QF_BV");
             }
             return;
