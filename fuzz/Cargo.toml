@@ -4,7 +4,6 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 readme = "README.md"
-changelog = "CHANGELOG.md"
 keywords = [
     "fuzzing",
     "sat",

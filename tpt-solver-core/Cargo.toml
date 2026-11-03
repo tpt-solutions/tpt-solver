@@ -8,7 +8,6 @@ authors.workspace = true
 repository.workspace = true
 description = "Untrusted but high-performance solving engine (CDCL, DPLL(T), Simplex) for the tpt-solver suite"
 readme = "README.md"
-changelog = "CHANGELOG.md"
 keywords = [
     "sat",
     "smt",
