@@ -34,5 +34,6 @@ text, its format, and the proof text.
 
 ## Feature status
 
-The only feature flag is `std`, which is on by default and does not change behaviour yet.
-Serde support is planned but not added.
+The `serde` feature serializes `Report`, `Stats`, `Proof`, `Model` and `Theory`, with the
+same field names as `--output json`. The `std` flag is on by default and does not
+change behaviour yet.

@@ -875,3 +875,134 @@ fn json_string(s: &str) -> String {
     out.push('"');
     out
 }
+
+#[cfg(feature = "serde")]
+mod serde_impls {
+    use super::{Proof, Report, Stats};
+    use serde::ser::{Serialize, SerializeStruct, Serializer};
+    use tpt_solver_check::outcome::Outcome;
+    use tpt_solver_core::engine::SolveResult;
+
+    fn claim_name(claim: SolveResult) -> &'static str {
+        match claim {
+            SolveResult::Sat => "sat",
+            SolveResult::Unsat => "unsat",
+            SolveResult::Unknown => "unknown",
+        }
+    }
+
+    fn checker_name(verdict: Outcome) -> &'static str {
+        if verdict.is_accept() {
+            "accept"
+        } else if verdict.is_reject() {
+            "reject"
+        } else {
+            "inconclusive"
+        }
+    }
+
+    impl Serialize for Report {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            let mut st = s.serialize_struct("Report", 7)?;
+            st.serialize_field("theory", &self.theory)?;
+            st.serialize_field("result", claim_name(self.claim))?;
+            st.serialize_field("checker", checker_name(self.verdict))?;
+            st.serialize_field("model", &self.model)?;
+            st.serialize_field("proof", &self.proof)?;
+            st.serialize_field("core", &self.core)?;
+            st.serialize_field("stats", &self.stats)?;
+            st.end()
+        }
+    }
+
+    impl Serialize for Stats {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            let mut st = s.serialize_struct("Stats", 4)?;
+            st.serialize_field("variables", &self.variables)?;
+            st.serialize_field("constraints", &self.constraints)?;
+            st.serialize_field("workers", &self.workers)?;
+            st.serialize_field("elapsed_ms", &(self.elapsed.as_secs_f64() * 1000.0))?;
+            st.end()
+        }
+    }
+
+    impl Serialize for Proof {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            match self {
+                Proof::Drat(clauses) => {
+                    let mut st = s.serialize_struct("Proof", 2)?;
+                    st.serialize_field("format", "drat")?;
+                    st.serialize_field("clauses", clauses)?;
+                    st.end()
+                }
+                Proof::Farkas(pairs) => {
+                    let rendered: Vec<(usize, String)> =
+                        pairs.iter().map(|(i, m)| (*i, m.to_string())).collect();
+                    let mut st = s.serialize_struct("Proof", 2)?;
+                    st.serialize_field("format", "farkas")?;
+                    st.serialize_field("multipliers", &rendered)?;
+                    st.end()
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Theory {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Model {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Model::Bool(values) => {
+                let lits: Vec<i64> = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &b)| {
+                        let v = (i + 1) as i64;
+                        if b {
+                            v
+                        } else {
+                            -v
+                        }
+                    })
+                    .collect();
+                s.serialize_newtype_variant("Model", 0, "bool", &lits)
+            }
+            Model::Named(pairs) => s.serialize_newtype_variant("Model", 1, "named", pairs),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod serde_tests {
+    use super::{solve_str, Format, Options};
+
+    #[test]
+    fn report_serializes_with_its_checker_verdict() {
+        let opts = Options {
+            want_proof: true,
+            ..Options::default()
+        };
+        let report = solve_str("p cnf 1 2\n1 0\n-1 0\n", Format::Dimacs, &opts).unwrap();
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["result"], "unsat");
+        assert_eq!(json["checker"], "accept");
+        assert_eq!(json["theory"], "CNF");
+        assert_eq!(json["proof"]["format"], "drat");
+        assert!(json["stats"]["elapsed_ms"].is_f64());
+    }
+
+    #[test]
+    fn sat_model_serializes_as_literals() {
+        let report = solve_str("p cnf 2 1\n-2 0\n", Format::Dimacs, &Options::default()).unwrap();
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["result"], "sat");
+        assert_eq!(json["model"]["bool"], serde_json::json!([1, -2]));
+    }
+}

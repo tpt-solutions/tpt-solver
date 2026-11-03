@@ -202,7 +202,7 @@ mod tests {
     fn empty_clause_is_unsat_marker() {
         let input = "p cnf 1 1\n0\n";
         let p = parse_dimacs(input).unwrap();
-        assert_eq!(p.clauses, vec![vec![]]);
+        assert_eq!(p.clauses, vec![Vec::<i32>::new()]);
     }
 
     #[test]
