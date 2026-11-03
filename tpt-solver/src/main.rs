@@ -1,424 +1,546 @@
-//! `tpt-solver` binary: end-to-end demonstration of the certificate architecture.
+//! `tpt-solver` binary: a certificate-architecture SAT/SMT solver CLI.
 //!
-//! Usage:
 //! ```text
-//! tpt-solver                          # run built-in demo (reference + CDCL, both certified)
-//! tpt-solver FILE.cnf                  # parse a DIMACS CNF, solve with CDCL, certify answer
-//! tpt-solver FILE.smt2                 # parse an SMT-LIB2 script, solve (LRA or SAT), certify
-//! tpt-solver FILE.mps                  # parse a free-format LP-MPS file, solve the LRA
-//!                                       # feasibility system (no objective optimization), certify
-//! tpt-solver FILE.cnf --fuel N
-//! tpt-solver FILE.cnf --parallel N     # race N diverse CDCL workers (DIMACS only)
-//! tpt-solver FILE.cnf --emit-proof P   # on UNSAT, dump the checked certificate to file P
-//! tpt-solver FILE.smt2 --explain       # on UNSAT (LRA only), print the implicated constraints
-//! tpt-solver --bench                   # local 3-SAT performance ladder
+//! tpt-solver FILE                     solve FILE (.cnf, .smt2, .mps, optionally .gz); "-" reads stdin
+//! tpt-solver FILE --format smt2       choose the format when it cannot be detected
+//! tpt-solver FILE --output competition  SAT-competition output and exit codes (10/20/0)
+//! tpt-solver FILE --emit-proof P      on UNSAT, write the checked certificate to P
+//! tpt-solver FILE --explain           on UNSAT, print the needed clauses or constraints
+//! tpt-solver check PROBLEM PROOF      check a proof file against its problem, without solving
+//! tpt-solver bench                    random 3-SAT ladder, CSV on stdout
+//! tpt-solver completions <SHELL>      print a shell completion script
+//! tpt-solver man                      print the man page
 //! ```
 //!
-//! Every answer is revalidated by the trusted checker (`tpt-solver-check`); the
-//! printed verdict is what may actually be trusted.
+//! Every answer is revalidated by the trusted checker (`tpt-solver-check`). The
+//! printed result is what the checker accepted, and the verdict is shown with it.
+//! Exit codes are described in the README.
 
-use clap::Parser;
-use tpt_solver::parsers::dimacs::parse_dimacs;
-use tpt_solver::parsers::mps::parse_mps;
-use tpt_solver::parsers::smtlib2::{parse_script, LraProblem, SmtError};
-use tpt_solver::policy::solve_certified_portfolio;
-use tpt_solver::reference::{
-    solve_and_check, solve_and_check_arrays, solve_and_check_bv, solve_and_check_cdcl,
-    solve_and_check_cdcl_with_proof, solve_and_check_lra_with_cert, Problem,
-};
+use std::fmt;
+use std::io::{self, Write};
+use std::process::ExitCode;
+use std::time::Duration;
+
+use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
+use tpt_solver::api::{self, Format, Model, Options, Proof, Report};
+use tpt_solver::policy::solve_cnf_certified;
+use tpt_solver::reference::{solve_and_check, solve_and_check_cdcl, Problem};
 use tpt_solver_check::outcome::Outcome;
 use tpt_solver_core::engine::SolveResult;
-use tpt_solver_core::lra::{FarkasCertificate, LinConstraint};
 
 /// tpt-solver: a certificate-architecture SAT/SMT solver suite.
 ///
 /// Every answer this CLI prints is revalidated by the independent trusted checker
-/// (`tpt-solver-check`) before being reported; run with no arguments for a built-in
-/// demo of that pipeline.
+/// (`tpt-solver-check`) before it is reported. Run with no input for a built-in demo
+/// of that pipeline.
 #[derive(Parser)]
-#[command(name = "tpt-solver", version, about, long_about = None)]
+#[command(
+    name = "tpt-solver",
+    version,
+    about,
+    args_conflicts_with_subcommands = true
+)]
 struct Cli {
-    /// Input file: .cnf (DIMACS), .smt2/.smt (SMT-LIB2), or .mps (LP-MPS).
-    /// Omit to run the built-in demo.
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Input file: DIMACS CNF, SMT-LIB2 (.smt2/.smt) or LP-MPS (.mps), optionally
+    /// gzip-compressed. Use `-` to read standard input. Omit to run the demo.
     ///
     /// MPS input is feasibility-only: the objective (N) row is dropped, so the
     /// solver answers whether the constraints are satisfiable and does not optimize.
-    path: Option<String>,
+    input: Option<String>,
 
-    /// Step budget for the engine before giving up with `Unknown`.
-    #[arg(long, default_value_t = 10_000_000)]
+    /// Input format, when it cannot be read from the extension or the content.
+    #[arg(long, value_name = "FORMAT", value_parser = parse_format_arg)]
+    format: Option<Format>,
+
+    /// How results are printed.
+    #[arg(long, value_enum, default_value_t = Output::Human)]
+    output: Output,
+
+    /// Step budget for each engine run before giving up with `unknown`.
+    #[arg(long, default_value_t = 10_000_000, value_name = "N")]
     fuel: u64,
 
-    /// Race N diverse CDCL workers instead of a single solve (DIMACS only).
+    /// Race N diverse CDCL workers (CNF inputs only).
     #[arg(long, value_name = "N")]
     parallel: Option<usize>,
 
-    /// Run the local 3-SAT performance ladder instead of solving a file.
-    #[arg(long)]
-    bench: bool,
+    /// Give up after SECS seconds of wall-clock time and report `unknown`.
+    #[arg(long, value_name = "SECS")]
+    timeout: Option<f64>,
 
-    /// On an UNSAT claim, write the checked certificate to FILE: an LRAT-style
-    /// clause dump for DIMACS/CNF, or the Farkas multipliers for SMT-LIB2/MPS LRA.
+    /// On UNSAT, write the checked certificate to FILE. CNF writes a DRAT-style clause
+    /// list, and LRA writes Farkas multipliers.
     #[arg(long, value_name = "FILE")]
     emit_proof: Option<String>,
 
-    /// On an UNSAT claim, print the minimal core of original constraints
-    /// implicated in the contradiction. LRA only in this release (SMT-LIB2/MPS);
-    /// a DIMACS/CNF UNSAT core needs clause-provenance tracking not yet wired in.
+    /// On UNSAT, report the clauses or constraints that are needed for the
+    /// contradiction. CNF cores are computed by deletion and cost one solve per clause.
     #[arg(long)]
     explain: bool,
+
+    /// Print the model on SAT (always printed in competition mode).
+    #[arg(long)]
+    model: bool,
+
+    /// Print sizes and timing to stderr.
+    #[arg(long)]
+    stats: bool,
+
+    /// More detail on stderr (repeat for more).
+    #[arg(short, long, action = ArgAction::Count, conflicts_with = "quiet")]
+    verbose: u8,
+
+    /// Print only the result line.
+    #[arg(short, long)]
+    quiet: bool,
 }
 
-/// Options threaded through every `run_*` function for a single file solve.
-struct RunOpts {
-    fuel: u64,
-    parallel: Option<usize>,
-    emit_proof: Option<String>,
-    explain: bool,
+#[derive(Subcommand)]
+enum Command {
+    /// Check a proof against its problem without solving the problem.
+    Check {
+        /// The problem file (DIMACS, SMT-LIB2 or MPS).
+        problem: String,
+        /// The proof file, as written by `--emit-proof`.
+        proof: String,
+        /// Problem format, when it cannot be detected.
+        #[arg(long, value_name = "FORMAT", value_parser = parse_format_arg)]
+        format: Option<Format>,
+    },
+    /// Run a random 3-SAT performance ladder through the certified pipeline (CSV).
+    Bench {
+        /// Random instances per size.
+        #[arg(long, default_value_t = 5)]
+        seeds: u32,
+    },
+    /// Print a shell completion script to stdout.
+    Completions {
+        /// The shell to generate for.
+        shell: clap_complete::Shell,
+    },
+    /// Print the man page (roff) to stdout.
+    Man,
 }
 
-fn main() {
-    let cli = Cli::parse();
-    if cli.bench {
-        run_bench();
-        return;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Output {
+    /// Readable text on stdout.
+    Human,
+    /// One JSON object on stdout.
+    Json,
+    /// SAT-competition format: `s` and `v` lines, exit codes 10, 20 and 0.
+    Competition,
+}
+
+fn parse_format_arg(s: &str) -> Result<Format, String> {
+    Format::from_name(s)
+        .ok_or_else(|| format!("unknown format '{s}' (expected dimacs, smt2 or mps)"))
+}
+
+/// Errors that stop the CLI before it can report an answer.
+#[derive(Debug)]
+enum CliError {
+    /// A library error: reading, parsing, lowering, or detection.
+    Api(api::Error),
+    /// Bad flag values.
+    Usage(String),
+    /// Writing an output file failed.
+    Write { path: String, source: io::Error },
+}
+
+impl fmt::Display for CliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CliError::Api(e) => write!(f, "{}", e),
+            CliError::Usage(msg) => write!(f, "{}", msg),
+            CliError::Write { path, source } => write!(f, "cannot write '{}': {}", path, source),
+        }
     }
-    let opts = RunOpts {
+}
+
+impl From<api::Error> for CliError {
+    fn from(e: api::Error) -> CliError {
+        CliError::Api(e)
+    }
+}
+
+fn main() -> ExitCode {
+    match run(Cli::parse()) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<ExitCode, CliError> {
+    match &cli.command {
+        Some(Command::Check {
+            problem,
+            proof,
+            format,
+        }) => run_check(problem, proof, *format),
+        Some(Command::Bench { seeds }) => {
+            run_bench(*seeds);
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Completions { shell }) => {
+            clap_complete::generate(*shell, &mut Cli::command(), "tpt-solver", &mut io::stdout());
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Man) => {
+            let man = clap_mangen::Man::new(Cli::command());
+            man.render(&mut io::stdout())
+                .map_err(|source| CliError::Write {
+                    path: "stdout".to_string(),
+                    source,
+                })?;
+            Ok(ExitCode::SUCCESS)
+        }
+        None => match &cli.input {
+            Some(path) => run_solve(&cli, path),
+            None => {
+                run_demo();
+                Ok(ExitCode::SUCCESS)
+            }
+        },
+    }
+}
+
+fn run_solve(cli: &Cli, path: &str) -> Result<ExitCode, CliError> {
+    let opts = Options {
         fuel: cli.fuel,
-        parallel: cli.parallel,
-        emit_proof: cli.emit_proof,
+        workers: cli.parallel.unwrap_or(1).max(1),
+        timeout: match cli.timeout {
+            Some(secs) => Some(
+                Duration::try_from_secs_f64(secs)
+                    .map_err(|_| CliError::Usage(format!("invalid --timeout {secs}")))?,
+            ),
+            None => None,
+        },
+        want_proof: cli.emit_proof.is_some(),
         explain: cli.explain,
     };
-    match cli.path {
-        Some(p) => run_file(&p, &opts),
-        None => run_demo(),
-    }
-}
 
-fn run_file(path: &str, opts: &RunOpts) {
-    if path.ends_with(".smt2") || path.ends_with(".smt") {
-        return run_smtlib2(path, opts);
+    let input = api::read_input(path)?;
+    let hint = (path != "-").then_some(path);
+    let format = api::resolve_format(cli.format, hint, &input)?;
+    if cli.verbose > 0 {
+        eprintln!("format: {}", format);
     }
-    if path.ends_with(".mps") {
-        return run_mps(path, opts);
-    }
-    run_dimacs(path, opts);
-}
 
-/// Report the certificate/explain output for an LRA UNSAT claim, shared by the
-/// SMT-LIB2 and MPS front ends (both lower to the same `LinConstraint` system).
-fn report_lra_unsat(cert: &FarkasCertificate, constraints: &[LinConstraint], opts: &RunOpts) {
-    if let Some(path) = &opts.emit_proof {
-        write_farkas_cert(path, cert);
-    }
-    if opts.explain {
-        print_lra_explain(cert, constraints);
-    }
-}
+    let report = api::solve_str(&input, format, &opts)?;
+    let accepted = report.verdict.is_accept();
 
-fn run_mps(path: &str, opts: &RunOpts) {
-    let input = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: cannot read '{}': {}", path, e);
-            std::process::exit(2);
-        }
-    };
-    let prob: LraProblem = match parse_mps(&input) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: failed to parse '{}': {}", path, e);
-            std::process::exit(2);
-        }
-    };
-    println!(
-        "parsed MPS: {} vars, {} constraints",
-        prob.var_count(),
-        prob.constraints.len()
-    );
-    let (claim, verdict, cert) = solve_and_check_lra_with_cert(&prob.constraints, opts.fuel);
-    print_verdict("LRA engine", claim, verdict);
-    if claim == SolveResult::Sat {
-        let model = extract_lra_model(&prob.constraints);
-        println!(
-            "model: {:?}",
-            prob.vars.iter().zip(&model).collect::<Vec<_>>()
+    if let Some(proof_path) = &cli.emit_proof {
+        emit_proof(proof_path, &report, cli.output)?;
+    }
+
+    if cli.stats || cli.verbose > 0 {
+        eprintln!(
+            "stats: theory={} variables={} constraints={} workers={} elapsed={:.1}ms",
+            report.theory,
+            report.stats.variables,
+            report.stats.constraints,
+            report.stats.workers,
+            report.stats.elapsed.as_secs_f64() * 1000.0
         );
-    } else if let Some(cert) = &cert {
-        report_lra_unsat(cert, &prob.constraints, opts);
+    }
+
+    match cli.output {
+        Output::Human => print_human(&report, cli),
+        Output::Competition => print_competition(&report),
+        Output::Json => print_json(&report, cli),
+    }
+
+    Ok(exit_code(&report, cli.output, accepted))
+}
+
+/// Exit status for a solve. Competition mode uses the SAT-competition codes. In the
+/// other modes, an answer the checker did not accept is `1`, so scripts can tell
+/// when the trusted kernel refused.
+fn exit_code(report: &Report, output: Output, accepted: bool) -> ExitCode {
+    let code = match (output, report.claim, accepted) {
+        (_, SolveResult::Unknown, _) => 0,
+        (_, _, false) => 1,
+        (Output::Competition, SolveResult::Sat, true) => 10,
+        (Output::Competition, SolveResult::Unsat, true) => 20,
+        (_, _, true) => 0,
+    };
+    ExitCode::from(code)
+}
+
+fn claim_label(claim: SolveResult) -> &'static str {
+    match claim {
+        SolveResult::Sat => "SAT",
+        SolveResult::Unsat => "UNSAT",
+        SolveResult::Unknown => "UNKNOWN",
     }
 }
 
-fn run_dimacs(path: &str, opts: &RunOpts) {
-    let input = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: cannot read '{}': {}", path, e);
-            std::process::exit(2);
-        }
-    };
-    let problem = match parse_dimacs(&input) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: failed to parse '{}': {}", path, e);
-            std::process::exit(2);
-        }
-    };
-    println!(
-        "parsed: {} variables, {} clauses",
-        problem.var_count,
-        problem.clauses.len()
-    );
-
-    let claim = match opts.parallel {
-        Some(workers) => {
-            println!("solving with {} racing portfolio workers", workers.max(1));
-            let (claim, verdict, dump) = solve_certified_portfolio(&problem, opts.fuel, workers);
-            if let Some(d) = dump {
-                println!("{}", d.render());
-            }
-            print_verdict("CDCL engine (portfolio)", claim, verdict);
-            if opts.emit_proof.is_some() {
-                eprintln!("note: --emit-proof is not supported with --parallel; re-run without --parallel to export a certificate");
-            }
-            claim
-        }
-        None => {
-            let (claim, verdict, proof) = solve_and_check_cdcl_with_proof(&problem, opts.fuel);
-            print_verdict("CDCL engine", claim, verdict);
-            if let (Some(path), Some(proof)) = (&opts.emit_proof, &proof) {
-                write_lrat_proof(path, proof);
-            }
-            if opts.explain && claim == SolveResult::Unsat {
-                println!("note: --explain is LRA-only in this release; no CNF/SAT UNSAT core is available");
-            }
-            claim
-        }
-    };
-
-    if claim == SolveResult::Sat {
-        if let Some(model) = solve_model(&problem, opts.fuel) {
-            println!(
-                "model (x1..x10 shown): {:?}",
-                &model[..core::cmp::min(10, model.len())]
-            );
-        }
+fn checker_label(verdict: Outcome) -> &'static str {
+    if verdict.is_accept() {
+        "accept"
+    } else if verdict.is_reject() {
+        "reject"
+    } else {
+        "inconclusive"
     }
 }
 
-fn run_smtlib2(path: &str, opts: &RunOpts) {
-    let input = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: cannot read '{}': {}", path, e);
-            std::process::exit(2);
-        }
-    };
-    let script = match parse_script(&input) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: failed to parse '{}': {}", path, e);
-            std::process::exit(2);
-        }
-    };
-    println!(
-        "parsed SMT-LIB2: logic={:?}, {} decls, {} asserts",
-        script.logic,
-        script.decl_count(),
-        script.assert_count()
-    );
+fn checker_note(claim: SolveResult, verdict: Outcome) -> &'static str {
+    match (claim, verdict.is_accept()) {
+        (SolveResult::Sat, true) => "model verified by the trusted kernel",
+        (SolveResult::Unsat, true) => "proof verified by the trusted kernel",
+        (SolveResult::Unknown, _) => "engine returned unknown (fuel or timeout)",
+        (SolveResult::Sat, false) => "checker did not accept the model; do not trust this answer",
+        (SolveResult::Unsat, false) => "checker did not accept the proof; do not trust this answer",
+    }
+}
 
-    // Prefer the LRA path (linear arithmetic); fall back to propositional SAT.
-    match script.to_lra() {
-        Ok(prob) => {
-            println!("lowering: QF_LRA ({} vars)", prob.var_count());
-            let (claim, verdict, cert) =
-                solve_and_check_lra_with_cert(&prob.constraints, opts.fuel);
-            print_verdict("LRA engine", claim, verdict);
-            if claim == SolveResult::Sat {
-                let model = extract_lra_model(&prob.constraints);
-                println!(
-                    "model: {:?}",
-                    prob.vars.iter().zip(&model).collect::<Vec<_>>()
-                );
-            } else if let Some(cert) = &cert {
-                report_lra_unsat(cert, &prob.constraints, opts);
-            }
-            return;
-        }
-        Err(SmtError::Unsupported(_)) => {
-            // Not linear arithmetic; try the bit-vector path.
-        }
-        Err(e) => {
-            eprintln!("error: LRA lowering failed: {}", e);
-            std::process::exit(2);
+fn print_human(report: &Report, cli: &Cli) {
+    println!(
+        "{}: {}",
+        claim_label(report.claim),
+        checker_note(report.claim, report.verdict)
+    );
+    if cli.quiet {
+        return;
+    }
+    println!("theory: {}", report.theory);
+    if cli.model {
+        if let Some(model) = &report.model {
+            println!("model: {}", model_text(model));
         }
     }
+    if let Some(core) = &report.core {
+        println!(
+            "core: {} of {} {}: {:?}",
+            core.len(),
+            report.stats.constraints,
+            if report.theory == api::Theory::Cnf {
+                "clauses"
+            } else {
+                "constraints"
+            },
+            core
+        );
+    }
+    if report.claim == SolveResult::Unsat && report.proof.is_none() && cli.emit_proof.is_some() {
+        println!("note: no proof was produced for this answer");
+    }
+}
 
-    match script.to_bv() {
-        Ok(prob) => {
-            println!("lowering: QF_BV ({} vars)", prob.names.len());
-            let (claim, verdict) = solve_and_check_bv(prob.var_count, &prob.assertions, opts.fuel);
-            print_verdict("BV engine", claim, verdict);
-            if claim == SolveResult::Sat {
-                // Deterministic engine: re-solving yields the same model.
-                if let Some(tpt_solver_core::bv::BvOutcome::Sat(model)) =
-                    tpt_solver_core::bv::solve_bv(prob.var_count, &prob.assertions, opts.fuel)
-                {
-                    println!(
-                        "model: {:?}",
-                        prob.names.iter().zip(&model.values).collect::<Vec<_>>()
-                    );
+fn model_text(model: &Model) -> String {
+    match model {
+        Model::Bool(values) => values
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| {
+                let v = (i + 1) as i64;
+                if b {
+                    v.to_string()
+                } else {
+                    (-v).to_string()
                 }
-            } else if claim == SolveResult::Unsat && (opts.emit_proof.is_some() || opts.explain) {
-                println!("note: --emit-proof/--explain are not yet supported for QF_BV");
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        Model::Named(pairs) => pairs
+            .iter()
+            .map(|(name, value)| format!("{} = {}", name, value))
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
+}
+
+fn print_competition(report: &Report) {
+    if report.claim != SolveResult::Unknown && !report.verdict.is_accept() {
+        println!("s UNKNOWN");
+        println!("c checker did not accept the answer");
+        return;
+    }
+    match report.claim {
+        SolveResult::Unknown => println!("s UNKNOWN"),
+        SolveResult::Unsat => println!("s UNSATISFIABLE"),
+        SolveResult::Sat => {
+            println!("s SATISFIABLE");
+            if let Some(Model::Bool(values)) = &report.model {
+                print_v_lines(values);
             }
-            return;
-        }
-        Err(SmtError::Unsupported(_)) => {
-            // Not bit-vector; try the array path.
-        }
-        Err(e) => {
-            eprintln!("error: BV lowering failed: {}", e);
-            std::process::exit(2);
         }
     }
+}
 
-    match script.to_array() {
-        Ok(prob) => {
-            println!(
-                "lowering: QF_AX ({} arrays, {} elements)",
-                prob.avars.len(),
-                prob.evars.len()
-            );
-            let (claim, verdict) = solve_and_check_arrays(
-                prob.avars.len() as u32,
-                prob.evars.len() as u32,
-                &prob.assertions,
-                opts.fuel,
-            );
-            print_verdict("AX engine", claim, verdict);
-            if claim == SolveResult::Unsat && (opts.emit_proof.is_some() || opts.explain) {
-                println!("note: --emit-proof/--explain are not yet supported for QF_AX");
-            }
-            return;
+/// Print a CNF model as SAT-competition `v` lines, wrapped near 78 columns and
+/// terminated by `0`.
+fn print_v_lines(values: &[bool]) {
+    let mut line = String::from("v");
+    for (i, &b) in values.iter().enumerate() {
+        let v = (i + 1) as i64;
+        let lit = if b { v } else { -v }.to_string();
+        if line.len() + 1 + lit.len() > 78 {
+            println!("{}", line);
+            line = String::from("v");
         }
-        Err(SmtError::Unsupported(_)) => {
-            // Not arrays; try the propositional path.
-        }
-        Err(e) => {
-            eprintln!("error: array lowering failed: {}", e);
-            std::process::exit(2);
+        line.push(' ');
+        line.push_str(&lit);
+    }
+    if line.len() + 2 > 78 {
+        println!("{}", line);
+        line = String::from("v");
+    }
+    line.push_str(" 0");
+    println!("{}", line);
+}
+
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
         }
     }
+    out.push('"');
+    out
+}
 
-    let problem = match script.to_cnf() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "error: could not lower script ({}); only QF_LRA and QF_SAT subsets are supported",
-                e
-            );
-            std::process::exit(2);
+fn print_json(report: &Report, cli: &Cli) {
+    let result = match report.claim {
+        SolveResult::Sat => "sat",
+        SolveResult::Unsat => "unsat",
+        SolveResult::Unknown => "unknown",
+    };
+    let model = match &report.model {
+        Some(Model::Bool(values)) => {
+            let lits: Vec<String> = values
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| {
+                    let v = (i + 1) as i64;
+                    (if b { v } else { -v }).to_string()
+                })
+                .collect();
+            format!("[{}]", lits.join(","))
         }
+        Some(Model::Named(pairs)) => {
+            let fields: Vec<String> = pairs
+                .iter()
+                .map(|(k, v)| format!("{}:{}", json_string(k), json_string(v)))
+                .collect();
+            format!("{{{}}}", fields.join(","))
+        }
+        None => "null".to_string(),
+    };
+    let core = match &report.core {
+        Some(c) => format!(
+            "[{}]",
+            c.iter().map(usize::to_string).collect::<Vec<_>>().join(",")
+        ),
+        None => "null".to_string(),
+    };
+    let proof = match &report.proof {
+        Some(Proof::Drat(steps)) => format!("{{\"steps\":{}}}", steps.len()),
+        Some(Proof::Farkas(pairs)) => format!("{{\"multipliers\":{}}}", pairs.len()),
+        None => "null".to_string(),
+    };
+    let proof_file = match &cli.emit_proof {
+        Some(p) if report.proof.is_some() => json_string(p),
+        _ => "null".to_string(),
     };
     println!(
-        "lowering: QF_SAT ({} vars, {} clauses)",
-        problem.var_count,
-        problem.clauses.len()
-    );
-    let (claim, verdict, proof) = solve_and_check_cdcl_with_proof(&problem, opts.fuel);
-    print_verdict("CDCL engine", claim, verdict);
-    if let (Some(path), Some(proof)) = (&opts.emit_proof, &proof) {
-        write_lrat_proof(path, proof);
-    }
-    if opts.explain && claim == SolveResult::Unsat {
-        println!("note: --explain is LRA-only in this release; no CNF/SAT UNSAT core is available");
-    }
-}
-
-/// Dump a checked [`tpt_solver_check::lrat::LratProof`] as a DRAT-style clause
-/// list (one derived clause per line, `0`-terminated, empty line for the final
-/// empty clause) so external tools (e.g. `drat-trim`) can independently
-/// re-verify the UNSAT claim. Full LRAT hints are not populated by the engine
-/// yet, so this is the plain-RUP subset of the format.
-fn write_lrat_proof(path: &str, proof: &tpt_solver_check::lrat::LratProof) {
-    let mut out = String::new();
-    for step in proof.steps() {
-        for lit in &step.clause {
-            let n = lit.var().get() as i64;
-            out.push_str(&(if lit.is_positive() { n } else { -n }).to_string());
-            out.push(' ');
-        }
-        out.push_str("0\n");
-    }
-    match std::fs::write(path, out) {
-        Ok(()) => println!(
-            "proof written to '{}' ({} step(s))",
-            path,
-            proof.steps().len()
-        ),
-        Err(e) => eprintln!("warning: failed to write proof to '{}': {}", path, e),
-    }
-}
-
-/// Dump a checked [`FarkasCertificate`] as one `index multiplier` line per
-/// original constraint (only nonzero multipliers are listed), so the
-/// contradiction `sum(multiplier_i * constraint_i) => 0 <= negative` can be
-/// independently re-derived.
-fn write_farkas_cert(path: &str, cert: &FarkasCertificate) {
-    let mut out = String::from("# Farkas certificate: nonzero (index multiplier) pairs\n");
-    for (i, m) in cert.multipliers.iter().enumerate() {
-        if !m.is_zero() {
-            out.push_str(&format!("{} {:?}\n", i, m));
-        }
-    }
-    match std::fs::write(path, out) {
-        Ok(()) => println!("proof written to '{}'", path),
-        Err(e) => eprintln!("warning: failed to write proof to '{}': {}", path, e),
-    }
-}
-
-/// Print the LRA UNSAT core: the original constraints with a nonzero Farkas
-/// multiplier, i.e. exactly those that participate in the contradiction.
-fn print_lra_explain(cert: &FarkasCertificate, constraints: &[LinConstraint]) {
-    let core: Vec<usize> = cert
-        .multipliers
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| !m.is_zero())
-        .map(|(i, _)| i)
-        .collect();
-    println!(
-        "explain: UNSAT core is {} of {} constraint(s): {:?}",
-        core.len(),
-        constraints.len(),
-        core
+        "{{\"result\":{},\"checker\":{},\"theory\":{},\"model\":{},\"core\":{},\"proof\":{},\"proof_file\":{},\"stats\":{{\"variables\":{},\"constraints\":{},\"workers\":{},\"elapsed_ms\":{:.3}}}}}",
+        json_string(result),
+        json_string(checker_label(report.verdict)),
+        json_string(&report.theory.to_string()),
+        model,
+        core,
+        proof,
+        proof_file,
+        report.stats.variables,
+        report.stats.constraints,
+        report.stats.workers,
+        report.stats.elapsed.as_secs_f64() * 1000.0
     );
 }
 
-/// Best-effort extraction of an LRA model for display (re-uses the core's Simplex).
-fn extract_lra_model(
-    constraints: &[tpt_solver_core::lra::LinConstraint],
-) -> Vec<tpt_solver_core::rational::Rational> {
-    match tpt_solver_core::lra::lra_model(constraints) {
-        Some(Some(m)) => m,
-        _ => Vec::new(),
+/// Write `report`'s proof to `path`. Warns on stderr when there is none to write.
+fn emit_proof(path: &str, report: &Report, output: Output) -> Result<(), CliError> {
+    let Some(proof) = &report.proof else {
+        if output != Output::Json {
+            eprintln!("note: --emit-proof: no UNSAT proof for this answer; nothing written");
+        }
+        return Ok(());
+    };
+    let mut text = String::new();
+    match proof {
+        Proof::Drat(clauses) => {
+            for clause in clauses {
+                for lit in clause {
+                    text.push_str(&lit.to_string());
+                    text.push(' ');
+                }
+                text.push_str("0\n");
+            }
+        }
+        Proof::Farkas(pairs) => {
+            text.push_str("# Farkas certificate: nonzero (index multiplier) pairs\n");
+            for (index, multiplier) in pairs {
+                text.push_str(&format!("{} {}\n", index, multiplier));
+            }
+        }
+    }
+    std::fs::write(path, text).map_err(|source| CliError::Write {
+        path: path.to_string(),
+        source,
+    })?;
+    if output != Output::Json {
+        eprintln!("proof written to '{}'", path);
+    }
+    Ok(())
+}
+
+fn run_check(problem: &str, proof: &str, format: Option<Format>) -> Result<ExitCode, CliError> {
+    let input = api::read_input(problem)?;
+    let hint = (problem != "-").then_some(problem);
+    let format = api::resolve_format(format, hint, &input)?;
+    let proof_text = api::read_input(proof)?;
+    let verdict = api::check_proof_text(&input, format, &proof_text)?;
+    match verdict {
+        Outcome::Accept => {
+            println!("s VERIFIED");
+            Ok(ExitCode::SUCCESS)
+        }
+        Outcome::Reject => {
+            println!("s NOT VERIFIED");
+            Ok(ExitCode::from(1))
+        }
+        Outcome::Inconclusive => {
+            println!("s INCONCLUSIVE");
+            Ok(ExitCode::from(1))
+        }
     }
 }
 
-fn solve_model(problem: &Problem, fuel: u64) -> Option<Vec<bool>> {
-    let ans = tpt_solver_core::sat::solve_cnf(problem.var_count, &problem.clauses, fuel);
-    ans.model
-}
-
-/// Local performance harness: a deterministic random 3-SAT ladder around the
-/// phase transition, run through the full certified CDCL pipeline.
+/// Local performance harness: a deterministic random 3-SAT ladder around the phase
+/// transition, run through the full certified CDCL pipeline. Output is CSV, one row
+/// per instance, so runs can be compared across commits.
 ///
-/// This is the offline scaffolding for the SAT-COMP/SMT-COMP benchmark item —
-/// real competition runs additionally need the official corpora and hardware,
-/// but this ladder catches gross performance regressions in CI-sized time.
-fn run_bench() {
+/// This is scaffolding for the SAT-COMP/SMT-COMP benchmark item. Competition runs
+/// need the official corpora and hardware. The ladder catches gross regressions in
+/// CI-sized time.
+fn run_bench(seeds: u32) {
     use std::time::Instant;
     struct Lcg(u64);
     impl Lcg {
@@ -434,17 +556,10 @@ fn run_bench() {
         }
     }
 
-    println!("bench: random 3-SAT ladder, certified CDCL pipeline (5 seeds each)");
-    println!(
-        "{:>6} {:>8} {:>12} {:>7}",
-        "vars", "clauses", "mean_ms", "sat%"
-    );
+    println!("vars,clauses,seed,millis,claim,checker");
     for &n in &[100usize, 200, 300, 400, 500] {
         let m = ((n as f64) * 4.26).round() as usize; // near the phase transition
-        let mut total_us = 0u128;
-        let mut sat_count = 0u32;
-        let runs = 5u32;
-        for seed in 0..runs {
+        for seed in 0..seeds {
             let mut rng = Lcg(0xBADC0DE ^ (n as u64) ^ ((seed as u64) * 7_919));
             let mut clauses: Vec<Vec<i32>> = Vec::with_capacity(m);
             for _ in 0..m {
@@ -461,21 +576,20 @@ fn run_bench() {
                 clauses,
             };
             let start = Instant::now();
-            let (claim, _verdict, _dump) =
-                tpt_solver::policy::solve_certified(&problem, 50_000_000);
-            total_us += start.elapsed().as_micros();
-            if claim == SolveResult::Sat {
-                sat_count += 1;
-            }
+            let (cert, _dump) = solve_cnf_certified(&problem, 50_000_000, 1);
+            let millis = start.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "{},{},{},{:.3},{},{}",
+                n,
+                m,
+                seed,
+                millis,
+                claim_label(cert.claim).to_lowercase(),
+                checker_label(cert.verdict)
+            );
         }
-        println!(
-            "{:>6} {:>8} {:>12.1} {:>6.0}%",
-            n,
-            m,
-            total_us as f64 / runs as f64 / 1000.0,
-            100.0 * sat_count as f64 / runs as f64
-        );
     }
+    let _ = io::stdout().flush();
 }
 
 fn run_demo() {
@@ -488,24 +602,13 @@ fn run_demo() {
         clauses: vec![vec![1, 2], vec![-1, 3], vec![-2, 3], vec![-3]],
     };
 
-    demo("reference DPLL", solve_and_check(&sat_problem, fuel_demo()));
-    demo(
-        "reference DPLL",
-        solve_and_check(&unsat_problem, fuel_demo()),
-    );
+    demo("reference DPLL", solve_and_check(&sat_problem, 1_000_000));
+    demo("reference DPLL", solve_and_check(&unsat_problem, 1_000_000));
+    demo("CDCL engine", solve_and_check_cdcl(&sat_problem, 1_000_000));
     demo(
         "CDCL engine",
-        solve_and_check_cdcl(&sat_problem, fuel_demo()),
+        solve_and_check_cdcl(&unsat_problem, 1_000_000),
     );
-    demo(
-        "CDCL engine",
-        solve_and_check_cdcl(&unsat_problem, fuel_demo()),
-    );
-}
-
-#[inline]
-fn fuel_demo() -> u64 {
-    1_000_000
 }
 
 fn demo(label: &str, (claim, verdict): (SolveResult, Outcome)) {
@@ -513,35 +616,5 @@ fn demo(label: &str, (claim, verdict): (SolveResult, Outcome)) {
         "[{:>15}] claim = {:?}, checker = {:?}",
         label, claim, verdict
     );
-    print_verdict_tail(claim, verdict);
-}
-
-fn print_verdict(label: &str, claim: SolveResult, verdict: Outcome) {
-    println!(
-        "[{:>15}] claim = {:?}, checker = {:?}",
-        label, claim, verdict
-    );
-    print_verdict_tail(claim, verdict);
-}
-
-fn print_verdict_tail(claim: SolveResult, verdict: Outcome) {
-    match claim {
-        SolveResult::Sat => {
-            if verdict.is_accept() {
-                println!("                 OK: model verified by the trusted kernel.");
-            } else {
-                println!("                 WARN: checker did not Accept the SAT model.");
-            }
-        }
-        SolveResult::Unsat => {
-            if verdict.is_accept() {
-                println!("                 OK: UNSAT proof verified by the trusted kernel.");
-            } else {
-                println!("                 WARN: checker did not Accept the UNSAT proof.");
-            }
-        }
-        SolveResult::Unknown => {
-            println!("                 engine returned Unknown (honest last resort).");
-        }
-    }
+    println!("                 {}", checker_note(claim, verdict));
 }
