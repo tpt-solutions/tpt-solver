@@ -340,39 +340,61 @@ Plan: `C:\Users\Phillip\.claude\plans\review-project-fix-any-vivid-quokka.md`.
       `todo.md` placeholder/arg-parser/clippy-failing notes (Phases 0, 4, 6).
 
 ### 7b — Acknowledged feature gaps
-- [ ] `--emit-proof` with `--parallel` (portfolio returns the winner's proof).
-- [ ] `--emit-proof` for QF_BV (reuse the proof passed to `check_bv_unsat`).
-- [ ] CNF `--explain`: clause IDs/antecedents in `sat.rs::analyze`, emit hints.
-- [ ] Array disequalities / extensionality (core + check).
+- [x] `--emit-proof` with `--parallel`: the portfolio returns the winning worker's
+      checked proof (`portfolio::solve_and_check_cdcl_portfolio_with_proof`).
+- [x] `--emit-proof` for QF_BV: the proof passed to `check_bv_unsat` is exported
+      (DRAT-style, over the bit-blast; see `docs/src/proof-format.md`).
+- [x] CNF `--explain`: done with a deletion-based core (one certified solve per clause)
+      rather than clause-provenance hints. The core is irreducible but not guaranteed
+      minimal. Recording antecedents in `sat.rs::analyze` is still open for a cheaper
+      core and for LRAT hints.
+- [ ] Array disequalities / extensionality (core + check). Open: needs a design for
+      certifying `a != b` (a witness index, checked by the kernel). Not started.
 - [x] Document in `--help` that MPS is feasibility-only (objective dropped).
 
 ### 7c — CLI and library ergonomics
-- [ ] Single `run() -> Result<ExitCode, CliError>`; remove scattered `process::exit`.
-- [ ] Content-based format detection, `--format`, stdin (`-`), `.gz` input.
-- [ ] `--output {human,json,competition}`; competition mode `s`/`v` lines with exit
-      codes 10/20/0; `--model`, `--timeout`, `-v/-q`, `--stats`; line/col parse errors.
-- [ ] Subcommands: `check <problem> <proof>`, `bench` (CSV), `completions <shell>`,
-      man page (clap_mangen).
-- [ ] Library: `prelude`, `solve_file`/`solve_str` -> `Result<Report, Error>` with a
-      unified `Error`; optional `serde` feature; `#![warn(missing_docs)]`; more examples.
-- [ ] Document the proof format exactly (LRAT vs DRAT); cross-check with `drat-trim`.
+- [x] Single `run() -> Result<ExitCode, CliError>`; `process::exit` is gone from the
+      solve path (the CLI maps errors to exit code 2 in `main`).
+- [x] Content-based format detection, `--format`, stdin (`-`), `.gz` input.
+- [x] `--output {human,json,competition}` with competition `s`/`v` lines and exit
+      codes 10/20/0; `--model`, `--timeout`, `-v/-q`, `--stats`.
+- [~] Parse errors carry a line number for DIMACS and MPS. Column numbers and
+      positions in SMT-LIB2 are still open.
+- [x] Subcommands: `check <problem> <proof>`, `bench` (CSV), `completions <shell>`,
+      `man` (clap_mangen).
+- [x] Library: `prelude`, `solve_str`/`solve_file` returning `Result<Report, Error>`
+      with a unified `Error`; `#![warn(missing_docs)]`; examples.
+- [ ] Optional `serde` feature for the library. Not started.
+- [~] Proof format documented exactly in `docs/src/proof-format.md`. The
+      `drat-trim` cross-check is still open: the tool is not installed here.
 
 ### 7d — Packaging and CI
-- [ ] `version = "0.1.0"` on path deps; homepage/documentation/include; `cargo publish
-      --dry-run` CI job.
-- [ ] cargo-dist release (archives, checksums, linux-arm64/musl, macOS x86_64, install
-      scripts, binstall); GHCR `Dockerfile`; README badges.
-- [ ] CI: Windows/macOS matrix, blocking `cargo-deny`, `cargo doc -D warnings`, `no_std`
-      build of core/check, Kani on `tpt-solver-check`, rust-cache, Dependabot.
-- [ ] `CONTRIBUTING.md`, `SECURITY.md`, root `CHANGELOG.md`, issue/PR templates; move
-      `spec.txt`/`todo.md` to `docs/internal/`.
+- [x] `version = "0.1.0"` on path deps; homepage, documentation and include lists; each
+      crate ships its licence files. `cargo publish --dry-run` runs in CI for core.
+      The dependent crates can only be dry-run after core is published.
+- [x] cargo-dist release (six targets, shell and PowerShell installers, sha256
+      checksums) generated into `.github/workflows/release.yml`; README badges.
+- [ ] GHCR `Dockerfile`. Not written: Docker is not available in this environment, so
+      it could not be built or tested.
+- [x] CI: Linux/Windows/macOS test matrix, blocking `cargo-deny`, `cargo doc -D
+      warnings`, `no_std` build of core/check for `wasm32-unknown-unknown`, rust-cache,
+      Dependabot.
+- [ ] Kani on `tpt-solver-check`. Open: the checker has no harnesses yet, and Kani is
+      not installed here to run them.
+- [x] `CONTRIBUTING.md`, `SECURITY.md`, root `CHANGELOG.md`, issue and PR templates;
+      `spec.txt` and `todo.md` moved to `docs/internal/`.
 
 ### 7e — Adoption tooling
-- [ ] WASM playground: `tpt-solver-wasm` crate + static page deployed to GitHub Pages.
-- [ ] Python bindings: `tpt-solver-py` (PyO3/maturin) with `solve_cnf`, `solve_smt2`,
-      `check_proof`; PyPI publish job.
-- [ ] Benchmark harness: criterion benches, `bench/` runner + small corpus, comparison
-      vs minisat/Z3, nightly regression job, `cargo llvm-cov`.
-- [ ] Docs site (mdBook): trust model, format/feature matrix, proof formats, fuel vs
-      timeout, FAQ; deploy to Pages.
-- [ ] Still open from Phase 6: SAT-COMP / SMT-COMP benchmark run.
+- [x] WASM playground: `tpt-solver-wasm` crate, page in `tpt-solver-wasm/web/`, and
+      Pages deploy of the book plus the playground. The WASM module was tested under
+      Node.
+- [x] Python bindings: `tpt-solver-py` (PyO3 0.23 / maturin) with `solve`, `solve_cnf`
+      and `check`. 10 pytest tests pass locally. A tagged PyPI publish job is in
+      `python.yml`. It needs PyPI trusted publishing configured.
+- [~] Benchmark harness: criterion benches, `bench/` corpus runner, nightly job and
+      llvm-cov job. Comparison against minisat is open. The runner records Z3 only
+      when `z3` is on PATH, and neither was available here.
+- [x] Docs site (mdBook): trust model, formats, proof formats, fuel versus timeout,
+      library use and FAQ; deployed by the Pages workflow.
+- [ ] Still open from Phase 6: SAT-COMP / SMT-COMP benchmark run (needs the official
+      corpora and hardware).
