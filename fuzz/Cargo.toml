@@ -27,3 +27,24 @@ libfuzzer-sys = "0.4"
 path = ".."
 
 [workspace]
+
+[[bin]]
+name = "dimacs"
+path = "fuzz_targets/dimacs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mps"
+path = "fuzz_targets/mps.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "smtlib2"
+path = "fuzz_targets/smtlib2.rs"
+test = false
+doc = false
+bench = false
