@@ -569,12 +569,8 @@ fn add_term(eg: &mut EGraph, term: &Term) -> Result<Id, SmtError> {
             let a = add_term(eg, &args[0])?;
             Ok(eg.add(BoolLang::Not(a)))
         }
-        Term::App(Op::And, args) => {
-            fold_binary(eg, args, BoolLang::True, BoolLang::And)
-        }
-        Term::App(Op::Or, args) => {
-            fold_binary(eg, args, BoolLang::False, BoolLang::Or)
-        }
+        Term::App(Op::And, args) => fold_binary(eg, args, BoolLang::True, BoolLang::And),
+        Term::App(Op::Or, args) => fold_binary(eg, args, BoolLang::False, BoolLang::Or),
         Term::App(Op::Imp, args) => {
             if args.len() != 2 {
                 return Err(SmtError::BadArity("=> expects 2 arguments".into()));
