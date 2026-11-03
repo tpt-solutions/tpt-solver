@@ -21,3 +21,7 @@ The workspace has three crates:
 | `tpt-solver` | Parsers, CLI, the library API, and the e-graph preprocessor | Periphery |
 
 Start with [the trust model](trust-model.md), or jump to [the command line](cli.md).
+
+To try the solver without installing anything, open the
+[browser playground](playground/index.html). It runs the same certified pipeline as
+the command line, compiled to WebAssembly.

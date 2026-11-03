@@ -206,6 +206,25 @@ pub struct Report {
     pub stats: Stats,
 }
 
+/// Start-of-call timestamp. `Instant` panics on `wasm32-unknown-unknown`, which has
+/// no clock, so there the elapsed time is reported as zero.
+#[derive(Clone, Copy, Debug)]
+struct Clock(Option<Instant>);
+
+impl Clock {
+    fn start() -> Clock {
+        if cfg!(target_arch = "wasm32") {
+            Clock(None)
+        } else {
+            Clock(Some(Instant::now()))
+        }
+    }
+
+    fn elapsed(self) -> Duration {
+        self.0.map_or(Duration::ZERO, |t| t.elapsed())
+    }
+}
+
 /// Options for a solve.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
@@ -350,9 +369,9 @@ pub fn resolve_format(
 /// should prefer a fuel budget.
 pub fn solve_str(input: &str, format: Format, opts: &Options) -> Result<Report, Error> {
     let Some(limit) = opts.timeout else {
-        return solve_now(input, format, opts, Instant::now());
+        return solve_now(input, format, opts, Clock::start());
     };
-    let start = Instant::now();
+    let start = Clock::start();
     let (tx, rx) = mpsc::channel();
     let owned = input.to_string();
     let worker_opts = opts.clone();
@@ -387,7 +406,7 @@ pub fn solve_file(path: &str, format: Option<Format>, opts: &Options) -> Result<
     solve_str(&input, format, opts)
 }
 
-fn solve_now(input: &str, format: Format, opts: &Options, start: Instant) -> Result<Report, Error> {
+fn solve_now(input: &str, format: Format, opts: &Options, start: Clock) -> Result<Report, Error> {
     match format {
         Format::Dimacs => {
             let problem = parse_dimacs_located(input).map_err(|e| Error::Parse {
@@ -414,7 +433,7 @@ fn parse_error(format: Format, e: Located<crate::parsers::mps::MpsError>) -> Err
     }
 }
 
-fn solve_smtlib2(input: &str, opts: &Options, start: Instant) -> Result<Report, Error> {
+fn solve_smtlib2(input: &str, opts: &Options, start: Clock) -> Result<Report, Error> {
     let script = parse_script(input).map_err(smt_error)?;
 
     // Prefer linear arithmetic, then bit-vectors, then arrays, then propositional.
@@ -506,7 +525,7 @@ fn smt_error(e: SmtError) -> Error {
     }
 }
 
-fn solve_cnf(problem: &Problem, opts: &Options, start: Instant) -> Report {
+fn solve_cnf(problem: &Problem, opts: &Options, start: Clock) -> Report {
     let (cert, _dump) = solve_cnf_certified(problem, opts.fuel, opts.workers);
     let claim = cert.claim;
     let verdict = cert.verdict;
@@ -569,7 +588,7 @@ fn solve_lra(
     constraints: &[LinConstraint],
     names: Vec<String>,
     opts: &Options,
-    start: Instant,
+    start: Clock,
 ) -> Report {
     let variables = names.len();
     let (claim, verdict, cert) = solve_and_check_lra_with_cert(constraints, opts.fuel);
@@ -763,4 +782,96 @@ fn check_farkas_text(constraints: &[LinConstraint], text: &str) -> Result<Outcom
         constraints,
         &FarkasCertificate { multipliers },
     ))
+}
+
+impl Report {
+    /// Render the report as one JSON object, in the shape `--output json` prints.
+    ///
+    /// `proof_file` is the path the proof was written to, if one was. Output is
+    /// compact and on a single line, with keys `result`, `checker`, `theory`,
+    /// `model`, `core`, `proof`, `proof_file` and `stats`.
+    pub fn to_json(&self, proof_file: Option<&str>) -> String {
+        let result = match self.claim {
+            SolveResult::Sat => "sat",
+            SolveResult::Unsat => "unsat",
+            SolveResult::Unknown => "unknown",
+        };
+        let checker = if self.verdict.is_accept() {
+            "accept"
+        } else if self.verdict.is_reject() {
+            "reject"
+        } else {
+            "inconclusive"
+        };
+        let model = match &self.model {
+            Some(Model::Bool(values)) => {
+                let lits: Vec<String> = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &b)| {
+                        let v = (i + 1) as i64;
+                        (if b { v } else { -v }).to_string()
+                    })
+                    .collect();
+                format!("[{}]", lits.join(","))
+            }
+            Some(Model::Named(pairs)) => {
+                let fields: Vec<String> = pairs
+                    .iter()
+                    .map(|(k, v)| format!("{}:{}", json_string(k), json_string(v)))
+                    .collect();
+                format!("{{{}}}", fields.join(","))
+            }
+            None => "null".to_string(),
+        };
+        let core = match &self.core {
+            Some(c) => format!(
+                "[{}]",
+                c.iter().map(usize::to_string).collect::<Vec<_>>().join(",")
+            ),
+            None => "null".to_string(),
+        };
+        let proof = match &self.proof {
+            Some(Proof::Drat(steps)) => format!("{{\"steps\":{}}}", steps.len()),
+            Some(Proof::Farkas(pairs)) => format!("{{\"multipliers\":{}}}", pairs.len()),
+            None => "null".to_string(),
+        };
+        let proof_file = match proof_file {
+            Some(p) if self.proof.is_some() => json_string(p),
+            _ => "null".to_string(),
+        };
+        format!(
+            "{{\"result\":{},\"checker\":{},\"theory\":{},\"model\":{},\"core\":{},\"proof\":{},\"proof_file\":{},\"stats\":{{\"variables\":{},\"constraints\":{},\"workers\":{},\"elapsed_ms\":{:.3}}}}}",
+            json_string(result),
+            json_string(checker),
+            json_string(&self.theory.to_string()),
+            model,
+            core,
+            proof,
+            proof_file,
+            self.stats.variables,
+            self.stats.constraints,
+            self.stats.workers,
+            self.stats.elapsed.as_secs_f64() * 1000.0
+        )
+    }
+}
+
+/// Quote and escape `s` as a JSON string.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }

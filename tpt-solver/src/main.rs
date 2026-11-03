@@ -398,83 +398,6 @@ fn print_v_lines(values: &[bool]) {
     println!("{}", line);
 }
 
-fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-fn print_json(report: &Report, cli: &Cli) {
-    let result = match report.claim {
-        SolveResult::Sat => "sat",
-        SolveResult::Unsat => "unsat",
-        SolveResult::Unknown => "unknown",
-    };
-    let model = match &report.model {
-        Some(Model::Bool(values)) => {
-            let lits: Vec<String> = values
-                .iter()
-                .enumerate()
-                .map(|(i, &b)| {
-                    let v = (i + 1) as i64;
-                    (if b { v } else { -v }).to_string()
-                })
-                .collect();
-            format!("[{}]", lits.join(","))
-        }
-        Some(Model::Named(pairs)) => {
-            let fields: Vec<String> = pairs
-                .iter()
-                .map(|(k, v)| format!("{}:{}", json_string(k), json_string(v)))
-                .collect();
-            format!("{{{}}}", fields.join(","))
-        }
-        None => "null".to_string(),
-    };
-    let core = match &report.core {
-        Some(c) => format!(
-            "[{}]",
-            c.iter().map(usize::to_string).collect::<Vec<_>>().join(",")
-        ),
-        None => "null".to_string(),
-    };
-    let proof = match &report.proof {
-        Some(Proof::Drat(steps)) => format!("{{\"steps\":{}}}", steps.len()),
-        Some(Proof::Farkas(pairs)) => format!("{{\"multipliers\":{}}}", pairs.len()),
-        None => "null".to_string(),
-    };
-    let proof_file = match &cli.emit_proof {
-        Some(p) if report.proof.is_some() => json_string(p),
-        _ => "null".to_string(),
-    };
-    println!(
-        "{{\"result\":{},\"checker\":{},\"theory\":{},\"model\":{},\"core\":{},\"proof\":{},\"proof_file\":{},\"stats\":{{\"variables\":{},\"constraints\":{},\"workers\":{},\"elapsed_ms\":{:.3}}}}}",
-        json_string(result),
-        json_string(checker_label(report.verdict)),
-        json_string(&report.theory.to_string()),
-        model,
-        core,
-        proof,
-        proof_file,
-        report.stats.variables,
-        report.stats.constraints,
-        report.stats.workers,
-        report.stats.elapsed.as_secs_f64() * 1000.0
-    );
-}
-
 /// Write `report`'s proof to `path`. Warns on stderr when there is none to write.
 fn emit_proof(path: &str, report: &Report, output: Output) -> Result<(), CliError> {
     let Some(proof) = &report.proof else {
@@ -617,4 +540,8 @@ fn demo(label: &str, (claim, verdict): (SolveResult, Outcome)) {
         label, claim, verdict
     );
     println!("                 {}", checker_note(claim, verdict));
+}
+
+fn print_json(report: &Report, cli: &Cli) {
+    println!("{}", report.to_json(cli.emit_proof.as_deref()));
 }

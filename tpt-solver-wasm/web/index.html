@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>tpt-solver playground</title>
+  <style>
+    :root {
+      --bg: #fafaf9; --fg: #1c1917; --muted: #57534e; --panel: #ffffff;
+      --border: #d6d3d1; --accent: #0f766e; --ok: #15803d; --bad: #b91c1c;
+      color-scheme: light dark;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) {
+        --bg: #1c1917; --fg: #f5f5f4; --muted: #a8a29e; --panel: #292524;
+        --border: #44403c; --accent: #5eead4; --ok: #4ade80; --bad: #f87171;
+      }
+    }
+    :root[data-theme="dark"] {
+      --bg: #1c1917; --fg: #f5f5f4; --muted: #a8a29e; --panel: #292524;
+      --border: #44403c; --accent: #5eead4; --ok: #4ade80; --bad: #f87171;
+    }
+    body {
+      margin: 0; background: var(--bg); color: var(--fg);
+      font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    main { max-width: 960px; margin: 0 auto; padding: 16px; }
+    h1 { font-size: 1.5rem; margin: 8px 0 4px; }
+    p.lede { color: var(--muted); margin: 0 0 16px; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+    select, input, button {
+      font: inherit; color: var(--fg); background: var(--panel);
+      border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px;
+    }
+    button { cursor: pointer; }
+    button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+    button:disabled { opacity: 0.5; cursor: default; }
+    textarea {
+      width: 100%; min-height: 220px; box-sizing: border-box;
+      font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: var(--fg); background: var(--panel);
+      border: 1px solid var(--border); border-radius: 6px; padding: 10px;
+    }
+    #result {
+      margin-top: 16px; padding: 12px 14px; background: var(--panel);
+      border: 1px solid var(--border); border-radius: 6px; min-height: 2em;
+    }
+    #verdict { font-weight: 600; font-size: 1.1rem; }
+    #verdict.ok { color: var(--ok); }
+    #verdict.bad { color: var(--bad); }
+    pre {
+      margin: 8px 0 0; white-space: pre-wrap; word-break: break-word;
+      font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: var(--muted);
+    }
+    .note { color: var(--muted); font-size: 13px; }
+    footer { margin-top: 24px; color: var(--muted); font-size: 13px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>tpt-solver playground</h1>
+  <p class="lede">
+    Paste a DIMACS CNF, SMT-LIB2 or LP-MPS problem. The solver runs in your browser,
+    and every answer is checked by the same trusted kernel as the command line.
+  </p>
+
+  <div class="row">
+    <label for="format">Format</label>
+    <select id="format">
+      <option value="auto">Detect</option>
+      <option value="dimacs">DIMACS CNF</option>
+      <option value="smt2">SMT-LIB2</option>
+      <option value="mps">LP-MPS</option>
+    </select>
+    <label for="fuel">Fuel</label>
+    <input id="fuel" type="number" min="1000" step="1000" value="2000000" style="width: 9em">
+    <span class="note">Caps the search, so a hard input returns unknown.</span>
+  </div>
+
+  <div class="row">
+    <button id="sample-cnf" type="button">Sample: CNF</button>
+    <button id="sample-lra" type="button">Sample: LRA</button>
+    <button id="sample-bv" type="button">Sample: BV</button>
+    <span style="flex: 1"></span>
+    <button id="solve" class="primary" type="button" disabled>Loading solver…</button>
+  </div>
+
+  <textarea id="input" spellcheck="false" aria-label="Problem input"></textarea>
+
+  <section id="result" aria-live="polite">
+    <div id="verdict">Enter a problem and press Solve.</div>
+    <pre id="details"></pre>
+  </section>
+
+  <footer>
+    Source and documentation:
+    <a href="https://github.com/tpt-solutions/tpt-solver">github.com/tpt-solutions/tpt-solver</a>
+  </footer>
+</main>
+
+<script type="module">
+  const SAMPLES = {
+    cnf: "c unsatisfiable example\np cnf 3 4\n1 2 0\n-1 3 0\n-2 3 0\n-3 0\n",
+    lra: "(set-logic QF_LRA)\n(declare-fun x () Real)\n(declare-fun y () Real)\n(assert (<= (+ x y) 1))\n(assert (>= x 2))\n(assert (>= y 0))\n(check-sat)\n",
+    bv: "(set-logic QF_BV)\n(declare-fun a () (_ BitVec 4))\n(assert (= a #x3))\n(assert (= a #x7))\n(check-sat)\n",
+  };
+
+  const input = document.getElementById("input");
+  const format = document.getElementById("format");
+  const fuel = document.getElementById("fuel");
+  const solveButton = document.getElementById("solve");
+  const verdict = document.getElementById("verdict");
+  const details = document.getElementById("details");
+
+  input.value = SAMPLES.cnf;
+  document.getElementById("sample-cnf").onclick = () => { input.value = SAMPLES.cnf; format.value = "dimacs"; };
+  document.getElementById("sample-lra").onclick = () => { input.value = SAMPLES.lra; format.value = "smt2"; };
+  document.getElementById("sample-bv").onclick = () => { input.value = SAMPLES.bv; format.value = "smt2"; };
+
+  function show(result) {
+    verdict.className = "";
+    if (result.error) {
+      verdict.textContent = "Error";
+      verdict.classList.add("bad");
+      details.textContent = result.error;
+      return;
+    }
+    const label = { sat: "SAT", unsat: "UNSAT", unknown: "UNKNOWN" }[result.result];
+    const checked = result.checker === "accept";
+    verdict.textContent = `${label}: ${checked ? "verified by the trusted kernel" : "checker did not accept this answer"}`;
+    verdict.classList.add(checked ? "ok" : "bad");
+    details.textContent = JSON.stringify(result, null, 2);
+  }
+
+  import("./pkg/tpt_solver_wasm.js")
+    .then((wasm) => {
+      solveButton.disabled = false;
+      solveButton.textContent = "Solve";
+      solveButton.onclick = () => {
+        const raw = wasm.solve(input.value, format.value, Number(fuel.value) || 2000000);
+        show(JSON.parse(raw));
+      };
+    })
+    .catch((err) => {
+      solveButton.textContent = "Solver unavailable";
+      verdict.textContent = "Could not load the WebAssembly solver.";
+      verdict.classList.add("bad");
+      details.textContent = String(err);
+    });
+</script>
+</body>
+</html>
