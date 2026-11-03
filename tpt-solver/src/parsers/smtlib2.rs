@@ -48,6 +48,10 @@ use tpt_solver_core::bv::BvTerm;
 use tpt_solver_core::lra::LinConstraint;
 use tpt_solver_core::rational::Rational;
 
+/// Most symbols a script may declare. Each becomes a solver variable, so this bounds
+/// the per-variable allocation, the same limit the DIMACS and MPS parsers enforce.
+const MAX_DECLARATIONS: usize = crate::parsers::dimacs::MAX_VARIABLES as usize;
+
 /// Errors produced while parsing or lowering an SMT-LIB2 script.
 #[derive(Debug)]
 pub enum SmtError {
@@ -1190,17 +1194,28 @@ pub fn parse_script(input: &str) -> Result<Script, SmtError> {
                             }
                         }
                         "set-option" => {}
-                        "declare-fun" | "declare-const" => {
-                            if let Some(decl) = parse_decl(head, items) {
+                        "declare-fun" | "declare-const" => match parse_decl(head, items) {
+                            Some(decl) => {
+                                if script.decls.len() >= MAX_DECLARATIONS {
+                                    return Err(SmtError::Unsupported(format!(
+                                        "more than {MAX_DECLARATIONS} declared symbols"
+                                    )));
+                                }
                                 script.decls.push(decl);
                             }
-                        }
-                        "assert" => {
-                            if let Some(body) = items.get(1) {
-                                script.asserts.push(sexp_to_term(body)?);
+                            None => {
+                                return Err(SmtError::Parse(format!("malformed {}", head)));
                             }
+                        },
+                        "define-fun" | "define-sort" | "declare-sort" | "push" | "pop"
+                        | "reset" | "reset-assertions" | "check-sat-assuming" | "get-value" => {
+                            return Err(SmtError::Unsupported(format!("command `{}`", head)));
                         }
-                        "check-sat" | "get-model" | "exit" | "push" | "pop" | "reset" => {}
+                        "assert" => match items.get(1) {
+                            Some(body) => script.asserts.push(sexp_to_term(body)?),
+                            None => return Err(SmtError::Parse("assert without a formula".into())),
+                        },
+                        "check-sat" | "get-model" | "exit" => {}
                         _ => {}
                     }
                 }
@@ -1786,5 +1801,37 @@ mod tests {
         );
         assert_eq!(claim, tpt_solver_core::engine::SolveResult::Sat);
         assert!(verdict.is_accept());
+    }
+
+    #[test]
+    fn unsupported_commands_are_errors_not_silent_no_ops() {
+        for src in [
+            "(declare-fun x () Real)(push 1)(assert (> x 0))",
+            "(declare-fun x () Real)(pop 1)(assert (> x 0))",
+            "(define-fun y () Real 1.0)(assert (> y 0))",
+            "(declare-sort U 0)(assert (= 1 1))",
+            "(declare-fun x () Real)(check-sat-assuming (x))(assert (> x 0))",
+            "(declare-fun x () Real)(get-value (x))(assert (> x 0))",
+        ] {
+            match parse_script(src) {
+                Err(SmtError::Unsupported(_)) => {}
+                other => panic!("{:?}: expected Unsupported, got {:?}", src, other),
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_declaration_and_empty_assert_are_parse_errors() {
+        for src in [
+            "(declare-fun x Real)(assert (> 1 0))",
+            "(declare-const)(assert (> 1 0))",
+            "(declare-fun)(assert (> 1 0))",
+            "(declare-fun x () Real)(assert)",
+        ] {
+            match parse_script(src) {
+                Err(SmtError::Parse(_)) => {}
+                other => panic!("{:?}: expected Parse error, got {:?}", src, other),
+            }
+        }
     }
 }
