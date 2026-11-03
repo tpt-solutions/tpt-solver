@@ -282,14 +282,7 @@ impl EGraph {
         false
     }
 
-    fn match_two(
-        &self,
-        p1: &Pat,
-        p2: &Pat,
-        c1: Id,
-        c2: Id,
-        subst: &mut Subst,
-    ) -> bool {
+    fn match_two(&self, p1: &Pat, p2: &Pat, c1: Id, c2: Id, subst: &mut Subst) -> bool {
         for mut cand1 in self.match_class(p1, c1) {
             if !self.consistent(subst, &cand1) {
                 continue;
@@ -877,10 +870,7 @@ mod tests {
 
     #[test]
     fn folds_and_with_false_to_false() {
-        let t = Term::App(
-            Op::And,
-            vec![Term::Sym("v0".into()), Term::Bool(false)],
-        );
+        let t = Term::App(Op::And, vec![Term::Sym("v0".into()), Term::Bool(false)]);
         let s = simplify_boolean(&t).unwrap();
         assert!(matches!(s, Term::Bool(false)));
     }
