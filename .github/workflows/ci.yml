@@ -49,7 +49,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Kani
-        run: cargo install kani && cargo kani setup
+        run: cargo install --locked kani-verifier && cargo kani setup
       - name: Run Kani harnesses (core)
         # `cargo kani` provides the `kani` crate and sets `cfg(kani)`; no Cargo
         # dependency or feature flag is required.
@@ -90,7 +90,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        # Pinned: cargo-deny 0.20+ requires rustc 1.88, above the 1.85 toolchain
+        # this job runs on. Bump together with the toolchain.
+        run: cargo install cargo-deny --locked --version 0.18.3
       - name: cargo deny check
         run: cargo deny check
 
@@ -101,13 +103,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        # The repo's rust-toolchain.toml pins 1.85, which rustup applies over the
+        # nightly default set above, and cargo-fuzz's dependencies need a newer
+        # rustc than 1.85. `+nightly` overrides the file.
+        run: cargo +nightly install cargo-fuzz --locked
       - name: Fuzz each target for 60s
         # Short timed runs, not a full fuzzing campaign: enough to catch an
         # immediate regression (e.g. the parser panics/stack overflows fixed in
         # Phase 6) on every PR, while a real fuzzing campaign stays a manual
-        # `cargo fuzz run <target>` outside CI.
+        # `cargo +nightly fuzz run <target>` outside CI.
         run: |
           for target in dimacs mps smtlib2; do
-            cargo fuzz run "$target" -- -max_total_time=60
+            cargo +nightly fuzz run "$target" -- -max_total_time=60
           done
