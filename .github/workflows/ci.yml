@@ -10,7 +10,7 @@ jobs:
     name: Format, clippy and docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -33,7 +33,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
@@ -51,7 +51,7 @@ jobs:
     name: no_std build (core, check)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -65,7 +65,7 @@ jobs:
     name: Publish dry run (tpt-solver-core)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Dry-run packaging the zero-dependency core
         # The other crates depend on core by version, so they can only be
@@ -76,7 +76,7 @@ jobs:
     name: Differential vs Z3
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Z3
         run: sudo apt-get update && sudo apt-get install -y z3
@@ -92,7 +92,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Kani
         # Prebuilt kani-verifier binary: building it from source with `cargo install`
@@ -118,7 +118,7 @@ jobs:
     name: Loom (portfolio cancellation flag)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Model-check cancel::Cancel under every thread interleaving
         # `cancel::Cancel` (tpt-solver-core/src/cancel.rs) is the one piece of
@@ -132,7 +132,7 @@ jobs:
     name: MSRV (1.85)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.85
       - name: cargo check on the declared MSRV
         run: cargo check --workspace
@@ -141,7 +141,7 @@ jobs:
     name: cargo-deny (advisories, licenses, bans)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-deny
         # Pinned: 0.18.3 can't parse CVSS 4.0 advisories (RUSTSEC-2025-0138), which
@@ -156,7 +156,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-fuzz
         # Prebuilt binary rather than `cargo install`, which compiled from source on
