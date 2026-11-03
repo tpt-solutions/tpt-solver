@@ -40,6 +40,9 @@ use tpt_solver_core::lra::{FarkasCertificate, LinConstraint};
 struct Cli {
     /// Input file: .cnf (DIMACS), .smt2/.smt (SMT-LIB2), or .mps (LP-MPS).
     /// Omit to run the built-in demo.
+    ///
+    /// MPS input is feasibility-only: the objective (N) row is dropped, so the
+    /// solver answers whether the constraints are satisfiable and does not optimize.
     path: Option<String>,
 
     /// Step budget for the engine before giving up with `Unknown`.

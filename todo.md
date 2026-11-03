@@ -344,7 +344,7 @@ Plan: `C:\Users\Phillip\.claude\plans\review-project-fix-any-vivid-quokka.md`.
 - [ ] `--emit-proof` for QF_BV (reuse the proof passed to `check_bv_unsat`).
 - [ ] CNF `--explain`: clause IDs/antecedents in `sat.rs::analyze`, emit hints.
 - [ ] Array disequalities / extensionality (core + check).
-- [ ] Document in `--help` that MPS is feasibility-only (objective dropped).
+- [x] Document in `--help` that MPS is feasibility-only (objective dropped).
 
 ### 7c — CLI and library ergonomics
 - [ ] Single `run() -> Result<ExitCode, CliError>`; remove scattered `process::exit`.
