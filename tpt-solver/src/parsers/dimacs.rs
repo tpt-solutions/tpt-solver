@@ -24,6 +24,12 @@ use std::fmt;
 /// exhaust memory before any search starts.
 pub const MAX_VARIABLES: u32 = 10_000_000;
 
+/// Largest clause count accepted, bounding the clause database built up front.
+pub const MAX_CLAUSES: usize = 10_000_000;
+
+/// Longest clause accepted, bounding a single clause's allocation.
+pub const MAX_CLAUSE_LEN: usize = 1_000_000;
+
 /// Error produced while parsing a DIMACS CNF stream.
 #[derive(Debug)]
 pub enum DimacsError {
@@ -35,6 +41,10 @@ pub enum DimacsError {
     ExpectedInteger(std::num::ParseIntError),
     /// The header or a literal declares more than [`MAX_VARIABLES`] variables.
     TooManyVariables(u32),
+    /// The input has more than [`MAX_CLAUSES`] clauses.
+    TooManyClauses,
+    /// A clause has more than [`MAX_CLAUSE_LEN`] literals.
+    ClauseTooLong,
 }
 
 impl fmt::Display for DimacsError {
@@ -51,6 +61,12 @@ impl fmt::Display for DimacsError {
                 "DIMACS: {} variables exceeds the limit of {}",
                 n, MAX_VARIABLES
             ),
+            DimacsError::TooManyClauses => {
+                write!(f, "DIMACS: more than {} clauses", MAX_CLAUSES)
+            }
+            DimacsError::ClauseTooLong => {
+                write!(f, "DIMACS: clause longer than {} literals", MAX_CLAUSE_LEN)
+            }
         }
     }
 }
@@ -99,9 +115,15 @@ pub fn parse_dimacs(input: &str) -> Result<Problem, DimacsError> {
             if lit == 0 {
                 // Terminator: close the current clause (an empty clause is a valid
                 // UNSAT marker and is kept as an empty Vec).
+                if clauses.len() >= MAX_CLAUSES {
+                    return Err(DimacsError::TooManyClauses);
+                }
                 clauses.push(std::mem::take(&mut current));
                 current = Vec::new();
             } else {
+                if current.len() >= MAX_CLAUSE_LEN {
+                    return Err(DimacsError::ClauseTooLong);
+                }
                 let v = lit.unsigned_abs();
                 if v > max_var {
                     max_var = v;
@@ -120,6 +142,9 @@ pub fn parse_dimacs(input: &str) -> Result<Problem, DimacsError> {
 
     if !current.is_empty() {
         // Some files omit the final `0`; treat the trailing run as a clause.
+        if clauses.len() >= MAX_CLAUSES {
+            return Err(DimacsError::TooManyClauses);
+        }
         clauses.push(current);
     }
 
@@ -171,6 +196,17 @@ mod tests {
     fn rejects_garbage_token() {
         let input = "p cnf 1 1\nx 0\n";
         assert!(parse_dimacs(input).is_err());
+    }
+
+    #[test]
+    fn rejects_clause_length_over_limit() {
+        let mut input = String::from("p cnf 1 1\n");
+        input.push_str(&"1 ".repeat(MAX_CLAUSE_LEN + 1));
+        input.push_str("0\n");
+        assert!(matches!(
+            parse_dimacs(&input),
+            Err(DimacsError::ClauseTooLong)
+        ));
     }
 
     #[test]

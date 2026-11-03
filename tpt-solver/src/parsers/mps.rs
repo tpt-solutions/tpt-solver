@@ -27,6 +27,7 @@
 //!   forms), never through floating point, matching the exact-math discipline
 //!   used everywhere else in the suite.
 
+use crate::parsers::dimacs::MAX_VARIABLES;
 use crate::parsers::smtlib2::LraProblem;
 use std::collections::HashMap;
 use std::error::Error;
@@ -52,6 +53,8 @@ pub enum MpsError {
     BadNumber(String),
     /// The document had no `ROWS` section at all.
     NoRows,
+    /// The document declares more columns than the solver's variable limit.
+    TooManyColumns,
 }
 
 impl fmt::Display for MpsError {
@@ -64,8 +67,30 @@ impl fmt::Display for MpsError {
             MpsError::UnknownRow(r) => write!(f, "MPS: reference to undeclared row '{}'", r),
             MpsError::BadNumber(s) => write!(f, "MPS: invalid number '{}'", s),
             MpsError::NoRows => write!(f, "MPS: no ROWS section"),
+            MpsError::TooManyColumns => {
+                write!(f, "MPS: more than {} columns (variables)", MAX_VARIABLES)
+            }
         }
     }
+}
+
+/// Return the index of column `name`, adding it if new. Capped at
+/// [`MAX_VARIABLES`], the same limit the DIMACS parser enforces, since every
+/// column becomes a solver variable.
+fn intern_col(
+    col_index: &mut HashMap<String, usize>,
+    col_order: &mut Vec<String>,
+    name: &str,
+) -> Result<usize, MpsError> {
+    if let Some(&idx) = col_index.get(name) {
+        return Ok(idx);
+    }
+    if col_order.len() >= MAX_VARIABLES as usize {
+        return Err(MpsError::TooManyColumns);
+    }
+    col_order.push(name.to_string());
+    col_index.insert(name.to_string(), col_order.len() - 1);
+    Ok(col_order.len() - 1)
 }
 
 impl Error for MpsError {}
@@ -182,10 +207,7 @@ pub fn parse_mps(input: &str) -> Result<LraProblem, MpsError> {
                 if toks.len() < 3 || toks.len() % 2 == 0 {
                     return Err(MpsError::OddPairCount(trimmed.to_string()));
                 }
-                let col = *col_index.entry(toks[0].to_string()).or_insert_with(|| {
-                    col_order.push(toks[0].to_string());
-                    col_order.len() - 1
-                });
+                let col = intern_col(&mut col_index, &mut col_order, toks[0])?;
                 let mut i = 1;
                 while i + 1 < toks.len() {
                     let row = toks[i];
@@ -234,10 +256,7 @@ pub fn parse_mps(input: &str) -> Result<LraProblem, MpsError> {
                     return Err(MpsError::BadBound(trimmed.to_string()));
                 }
                 let btype = toks[0].to_ascii_uppercase();
-                let col = *col_index.entry(toks[2].to_string()).or_insert_with(|| {
-                    col_order.push(toks[2].to_string());
-                    col_order.len() - 1
-                });
+                let col = intern_col(&mut col_index, &mut col_order, toks[2])?;
                 let b = bounds.entry(col).or_default();
                 match btype.as_str() {
                     "UP" => {
