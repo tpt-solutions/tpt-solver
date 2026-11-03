@@ -23,7 +23,8 @@ zero-dependency crates forbid.
 | `parsers::smtlib2` | SMT-LIB2 tokenizer, S-expression parser, term AST, and lowerings to QF_LRA, QF_BV, QF_AX, and QF_SAT (Tseitin CNF). |
 | `parsers::mps` | Free-format LP-MPS (`ROWS`/`COLUMNS`/`RHS`/`RANGES`/`BOUNDS`/`ENDATA`) parser that lowers to the same `LraProblem` the SMT-LIB2 LRA path uses (feasibility only — the objective row is dropped). |
 | `egraph` | In-house, dependency-free e-graph Boolean-fragment preprocessing (equality saturation over `and`/`or`/`not`/`xor`/`iff`/`ite`) bounded like every other loop in the suite; verified by truth-table equivalence, not just a re-solve comparison. |
-| `policy` | Tiered, fail-closed live-request fallback (`solve_certified`): reseed-and-recheck on rejected SAT, fall back to the reference DPLL, then `Unknown` as the true last resort. `solve_certified_portfolio` gives the parallel path the same policy. |
+| `api` | One-call entry points `solve_str` and `solve_file`: format detection, solving, certification, and a `Report` with model, proof, and core. |
+| `policy` | Tiered, fail-closed live-request fallback (`solve_certified`, `solve_cnf_certified`): reseed-and-recheck on rejected SAT, fall back to the reference DPLL, then `Unknown` as the true last resort. `solve_certified_portfolio` gives the parallel path the same policy. |
 | `portfolio` | Parallel portfolio SAT solving: diverse CDCL workers race the same CNF on OS threads behind a cooperative-cancellation flag. |
 | `reference` | Reference DPLL solver and the end-to-end `solve_and_check_*` integration entry points (CDCL, LRA, BV, arrays) that return a `(claim, verdict)` pair. |
 
@@ -39,12 +40,11 @@ tpt-solver FILE.smt2       # parse SMT-LIB2, solve (LRA/BV/AX/SAT), certify
 tpt-solver FILE.mps        # parse LP-MPS, solve the LRA feasibility system, certify
 tpt-solver FILE.cnf --fuel N
 tpt-solver FILE.cnf --parallel N   # race N diverse CDCL workers (DIMACS only)
-tpt-solver --bench         # offline random 3-SAT ladder through the certified pipeline
+tpt-solver bench --seeds 5  # random 3-SAT ladder through the certified pipeline (CSV)
 ```
 
 Every printed verdict is what the trusted checker (`tpt-solver-check`) returned — that is the
-only answer that may be trusted. The CLI is `clap`-based and has `--help`,
-`--version`, `--emit-proof` and `--explain`.
+only answer that may be trusted. The CLI is `clap`-based. See `tpt-solver --help` and the [user guide](../docs/src/cli.md).
 
 ## Usage as a library
 

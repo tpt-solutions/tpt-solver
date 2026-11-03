@@ -1,0 +1,10 @@
+[book]
+title = "tpt-solver"
+authors = ["TPT Solutions"]
+language = "en"
+src = "src"
+description = "A certificate-checked SAT and SMT solver suite in pure Rust."
+
+[output.html]
+git-repository-url = "https://github.com/tpt-solutions/tpt-solver"
+edit-url-template = "https://github.com/tpt-solutions/tpt-solver/edit/master/docs/{path}"

@@ -19,3 +19,4 @@ fuzz/artifacts
 
 # Kani / verification output
 *.kani
+docs/book/
