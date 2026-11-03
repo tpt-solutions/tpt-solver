@@ -44,7 +44,7 @@ fn kani_fuel_burn_drains() {
 fn kani_lit_packing_roundtrip() {
     let raw: u32 = kani::any();
     kani::assume(raw != 0);
-    let v = VarId::from_nonzero(unsafe { NonZeroU32::new_unchecked(raw) });
+    let v: VarId = VarId::from_nonzero(unsafe { NonZeroU32::new_unchecked(raw) });
     let pol: bool = kani::any();
     let l = Lit::new(v, pol);
     assert_eq!(l.var(), v);

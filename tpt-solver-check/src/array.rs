@@ -191,13 +191,13 @@ impl KernelAx {
         if ra == rb {
             return;
         }
-        if self.rank[ra] < self.rank[rb] {
-            self.parent[ra] = rb;
-        } else if self.rank[ra] > self.rank[rb] {
-            self.parent[rb] = ra;
-        } else {
-            self.parent[rb] = ra;
-            self.rank[ra] += 1;
+        match self.rank[ra].cmp(&self.rank[rb]) {
+            core::cmp::Ordering::Less => self.parent[ra] = rb,
+            core::cmp::Ordering::Greater => self.parent[rb] = ra,
+            core::cmp::Ordering::Equal => {
+                self.parent[rb] = ra;
+                self.rank[ra] += 1;
+            }
         }
     }
 }
