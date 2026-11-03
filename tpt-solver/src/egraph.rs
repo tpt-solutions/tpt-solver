@@ -392,11 +392,11 @@ struct Rule {
 }
 
 impl Rule {
-    fn new(lhs: &str, rhs: &str) -> Self {
-        Rule {
-            lhs: parse_pat(lhs),
-            rhs: parse_pat(rhs),
-        }
+    fn new(lhs: &str, rhs: &str) -> Result<Self, SmtError> {
+        Ok(Rule {
+            lhs: parse_pat(lhs)?,
+            rhs: parse_pat(rhs)?,
+        })
     }
 }
 
@@ -425,26 +425,35 @@ fn tokenize(s: &str) -> Vec<String> {
     toks
 }
 
-fn parse_pat(s: &str) -> Pat {
+/// Parse a rewrite-rule pattern. The rule table is fixed in this file, so an error
+/// here means a malformed built-in rule; it is reported rather than panicking.
+fn parse_pat(s: &str) -> Result<Pat, SmtError> {
     let toks = tokenize(s);
-    let (pat, rest) = parse_pat_tokens(&toks, 0);
-    assert!(rest == toks.len(), "trailing tokens in pattern: {s}");
-    pat
+    let (pat, rest) = parse_pat_tokens(&toks, 0)?;
+    if rest != toks.len() {
+        return Err(SmtError::Parse(format!("trailing tokens in pattern: {s}")));
+    }
+    Ok(pat)
 }
 
-fn parse_pat_tokens(toks: &[String], i: usize) -> (Pat, usize) {
-    if toks[i] == "(" {
-        let op = toks[i + 1].clone();
+fn parse_pat_tokens(toks: &[String], i: usize) -> Result<(Pat, usize), SmtError> {
+    let tok = |k: usize| {
+        toks.get(k)
+            .map(String::as_str)
+            .ok_or_else(|| SmtError::Parse("truncated rewrite pattern".into()))
+    };
+    if tok(i)? == "(" {
+        let op = tok(i + 1)?;
         let mut j = i + 2;
         let mut args = Vec::new();
-        while toks[j] != ")" {
-            let (p, nj) = parse_pat_tokens(toks, j);
+        while tok(j)? != ")" {
+            let (p, nj) = parse_pat_tokens(toks, j)?;
             args.push(p);
             j = nj;
         }
-        (make_op(&op, args), j + 1)
+        Ok((make_op(op, args)?, j + 1))
     } else {
-        let atom = &toks[i];
+        let atom = tok(i)?;
         let pat = if let Some(name) = atom.strip_prefix('?') {
             Pat::Var(name.to_string())
         } else if atom == "true" {
@@ -452,78 +461,91 @@ fn parse_pat_tokens(toks: &[String], i: usize) -> (Pat, usize) {
         } else if atom == "false" {
             Pat::False
         } else {
-            Pat::Sym(atom.clone())
+            Pat::Sym(atom.to_string())
         };
-        (pat, i + 1)
+        Ok((pat, i + 1))
     }
 }
 
-fn make_op(op: &str, args: Vec<Pat>) -> Pat {
-    match op {
-        "not" => Pat::Not(Box::new(args[0].clone())),
-        "and" => Pat::And(Box::new(args[0].clone()), Box::new(args[1].clone())),
-        "or" => Pat::Or(Box::new(args[0].clone()), Box::new(args[1].clone())),
-        "xor" => Pat::Xor(Box::new(args[0].clone()), Box::new(args[1].clone())),
-        "iff" => Pat::Iff(Box::new(args[0].clone()), Box::new(args[1].clone())),
-        "ite" => Pat::Ite(
-            Box::new(args[0].clone()),
-            Box::new(args[1].clone()),
-            Box::new(args[2].clone()),
+fn make_op(op: &str, args: Vec<Pat>) -> Result<Pat, SmtError> {
+    Ok(match (op, args.as_slice()) {
+        ("not", [a]) => Pat::Not(Box::new(a.clone())),
+        ("and", [a, b]) => Pat::And(Box::new(a.clone()), Box::new(b.clone())),
+        ("or", [a, b]) => Pat::Or(Box::new(a.clone()), Box::new(b.clone())),
+        ("xor", [a, b]) => Pat::Xor(Box::new(a.clone()), Box::new(b.clone())),
+        ("iff", [a, b]) => Pat::Iff(Box::new(a.clone()), Box::new(b.clone())),
+        ("ite", [a, b, c]) => Pat::Ite(
+            Box::new(a.clone()),
+            Box::new(b.clone()),
+            Box::new(c.clone()),
         ),
-        other => panic!("unknown operator in rewrite rule: {other}"),
-    }
+        ("not" | "and" | "or" | "xor" | "iff" | "ite", _) => {
+            return Err(SmtError::BadArity(format!(
+                "rewrite operator `{op}` given {} arguments",
+                args.len()
+            )))
+        }
+        _ => {
+            return Err(SmtError::Parse(format!(
+                "unknown operator in rewrite rule: {op}"
+            )))
+        }
+    })
 }
 
-fn rules() -> Vec<Rule> {
-    vec![
-        Rule::new("(and ?a ?b)", "(and ?b ?a)"),
-        Rule::new("(and (and ?a ?b) ?c)", "(and ?a (and ?b ?c))"),
-        Rule::new("(and ?a (and ?b ?c))", "(and (and ?a ?b) ?c)"),
-        Rule::new("(or ?a ?b)", "(or ?b ?a)"),
-        Rule::new("(or (or ?a ?b) ?c)", "(or ?a (or ?b ?c))"),
-        Rule::new("(or ?a (or ?b ?c))", "(or (or ?a ?b) ?c)"),
+fn rules() -> Result<Vec<Rule>, SmtError> {
+    [
+        ("(and ?a ?b)", "(and ?b ?a)"),
+        ("(and (and ?a ?b) ?c)", "(and ?a (and ?b ?c))"),
+        ("(and ?a (and ?b ?c))", "(and (and ?a ?b) ?c)"),
+        ("(or ?a ?b)", "(or ?b ?a)"),
+        ("(or (or ?a ?b) ?c)", "(or ?a (or ?b ?c))"),
+        ("(or ?a (or ?b ?c))", "(or (or ?a ?b) ?c)"),
         // Only the eliminating direction: the reverse (`?a => (not (not ?a))`)
         // matches every term and would blow up the e-graph without bound.
-        Rule::new("(not (not ?a))", "?a"),
-        Rule::new("(not true)", "false"),
-        Rule::new("(not false)", "true"),
-        Rule::new("(and ?a true)", "?a"),
-        Rule::new("(and true ?a)", "?a"),
-        Rule::new("(and ?a false)", "false"),
-        Rule::new("(and false ?a)", "false"),
-        Rule::new("(or ?a true)", "true"),
-        Rule::new("(or true ?a)", "true"),
-        Rule::new("(or ?a false)", "?a"),
-        Rule::new("(or false ?a)", "?a"),
-        Rule::new("(and ?a ?a)", "?a"),
-        Rule::new("(or ?a ?a)", "?a"),
-        Rule::new("(not (and ?a ?b))", "(or (not ?a) (not ?b))"),
-        Rule::new("(or (not ?a) (not ?b))", "(not (and ?a ?b))"),
-        Rule::new("(not (or ?a ?b))", "(and (not ?a) (not ?b))"),
-        Rule::new("(and (not ?a) (not ?b))", "(not (or ?a ?b))"),
-        Rule::new("(and ?a (not ?a))", "false"),
-        Rule::new("(and (not ?a) ?a)", "false"),
-        Rule::new("(or ?a (not ?a))", "true"),
-        Rule::new("(or (not ?a) ?a)", "true"),
-        Rule::new("(and ?a (or ?a ?b))", "?a"),
-        Rule::new("(or ?a (and ?a ?b))", "?a"),
-        Rule::new("(xor ?a false)", "?a"),
-        Rule::new("(xor ?a true)", "(not ?a)"),
-        Rule::new("(xor ?a ?a)", "false"),
-        Rule::new("(xor ?a ?b)", "(xor ?b ?a)"),
-        Rule::new("(iff ?a true)", "?a"),
-        Rule::new("(iff ?a false)", "(not ?a)"),
-        Rule::new("(iff ?a ?a)", "true"),
-        Rule::new("(iff ?a ?b)", "(iff ?b ?a)"),
-        Rule::new("(not (xor ?a ?b))", "(iff ?a ?b)"),
-        Rule::new("(not (iff ?a ?b))", "(xor ?a ?b)"),
-        Rule::new("(ite true ?a ?b)", "?a"),
-        Rule::new("(ite false ?a ?b)", "?b"),
-        Rule::new("(ite ?c ?a ?a)", "?a"),
-        Rule::new("(ite ?c true ?b)", "(or ?c ?b)"),
-        Rule::new("(ite ?c false ?b)", "(and (not ?c) ?b)"),
-        Rule::new("(ite ?c true false)", "?c"),
+        ("(not (not ?a))", "?a"),
+        ("(not true)", "false"),
+        ("(not false)", "true"),
+        ("(and ?a true)", "?a"),
+        ("(and true ?a)", "?a"),
+        ("(and ?a false)", "false"),
+        ("(and false ?a)", "false"),
+        ("(or ?a true)", "true"),
+        ("(or true ?a)", "true"),
+        ("(or ?a false)", "?a"),
+        ("(or false ?a)", "?a"),
+        ("(and ?a ?a)", "?a"),
+        ("(or ?a ?a)", "?a"),
+        ("(not (and ?a ?b))", "(or (not ?a) (not ?b))"),
+        ("(or (not ?a) (not ?b))", "(not (and ?a ?b))"),
+        ("(not (or ?a ?b))", "(and (not ?a) (not ?b))"),
+        ("(and (not ?a) (not ?b))", "(not (or ?a ?b))"),
+        ("(and ?a (not ?a))", "false"),
+        ("(and (not ?a) ?a)", "false"),
+        ("(or ?a (not ?a))", "true"),
+        ("(or (not ?a) ?a)", "true"),
+        ("(and ?a (or ?a ?b))", "?a"),
+        ("(or ?a (and ?a ?b))", "?a"),
+        ("(xor ?a false)", "?a"),
+        ("(xor ?a true)", "(not ?a)"),
+        ("(xor ?a ?a)", "false"),
+        ("(xor ?a ?b)", "(xor ?b ?a)"),
+        ("(iff ?a true)", "?a"),
+        ("(iff ?a false)", "(not ?a)"),
+        ("(iff ?a ?a)", "true"),
+        ("(iff ?a ?b)", "(iff ?b ?a)"),
+        ("(not (xor ?a ?b))", "(iff ?a ?b)"),
+        ("(not (iff ?a ?b))", "(xor ?a ?b)"),
+        ("(ite true ?a ?b)", "?a"),
+        ("(ite false ?a ?b)", "?b"),
+        ("(ite ?c ?a ?a)", "?a"),
+        ("(ite ?c true ?b)", "(or ?c ?b)"),
+        ("(ite ?c false ?b)", "(and (not ?c) ?b)"),
+        ("(ite ?c true false)", "?c"),
     ]
+    .into_iter()
+    .map(|(lhs, rhs)| Rule::new(lhs, rhs))
+    .collect()
 }
 
 // ----------------------------------------------------------------------------
@@ -744,7 +766,7 @@ pub(crate) fn simplify_boolean(term: &Term) -> Result<Term, SmtError> {
     let mut eg = EGraph::new();
     let root = add_term(&mut eg, term)?;
 
-    let rules = rules();
+    let rules = rules()?;
     let mut count = eg.size();
     for _ in 0..ITER_LIMIT {
         let mut applied = false;
@@ -883,6 +905,23 @@ mod tests {
         assert!(matches!(
             simplify_boolean(&t),
             Err(SmtError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn builtin_rules_parse_and_bad_patterns_error_instead_of_panicking() {
+        assert!(rules().is_ok());
+        assert!(matches!(
+            Rule::new("(frob ?a)", "?a"),
+            Err(SmtError::Parse(_))
+        ));
+        assert!(matches!(
+            Rule::new("(not ?a ?b)", "?a"),
+            Err(SmtError::BadArity(_))
+        ));
+        assert!(matches!(
+            Rule::new("(and ?a", "?a"),
+            Err(SmtError::Parse(_))
         ));
     }
 }

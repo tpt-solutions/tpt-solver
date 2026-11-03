@@ -21,6 +21,10 @@ use tpt_solver_core::sat::SatAnswer;
 
 /// A formula in simple (non-branded) CNF: each literal is `var` (positive) or `-var`
 /// (negative), `var` in `1..=var_count`.
+///
+/// Invariant: no literal is `0`. The parsers in this crate never produce one, and
+/// [`Problem::as_cnf`] relies on it. Fields are public, so a hand-built problem that
+/// breaks it panics there rather than being silently weakened.
 #[derive(Clone, Debug)]
 pub struct Problem {
     pub var_count: u32,
@@ -29,6 +33,10 @@ pub struct Problem {
 
 impl Problem {
     /// The same problem expressed as a [`Cnf`] for the checker.
+    ///
+    /// # Panics
+    ///
+    /// If a literal is `0` (violating the [`Problem`] invariant).
     pub fn as_cnf(&self) -> Cnf {
         let clauses = self
             .clauses
@@ -36,7 +44,8 @@ impl Problem {
             .map(|c| {
                 c.iter()
                     .map(|&l| {
-                        let v = VarId::new(l.unsigned_abs()).expect("non-zero var");
+                        let v =
+                            VarId::new(l.unsigned_abs()).expect("Problem literal must be non-zero");
                         Lit::new(v, l > 0)
                     })
                     .collect::<Vec<_>>()
