@@ -181,6 +181,14 @@ fn run_z3(smt2: &str) -> Option<SolveResult> {
         })
         .ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // Z3 keeps going after a rejected command and can still print a verdict
+    // (`sat` with the assertions dropped), so a script error is a hard failure.
+    assert!(
+        !stdout.contains("(error"),
+        "z3 rejected the emitted script:\n{}\n{}",
+        stdout,
+        smt2
+    );
     stdout.lines().find_map(|l| {
         let t = l.trim();
         if t == "sat" {
@@ -600,6 +608,10 @@ fn bv_z3_serialization_roundtrips_through_own_parser() {
 // ---------------------------------------------------------------------------
 // Array differential lane (QF_AX)
 // ---------------------------------------------------------------------------
+//
+// Scripts declare `Int` sorts, so they use `QF_ALIA` rather than `QF_AX`: Z3
+// rejects `Int` under `QF_AX`, reports the errors on stdout, and then answers
+// `sat` with the assertions dropped.
 
 /// Serialize an element term (`e{id}` element vars, `a{id}` array vars).
 fn ax_elem_to_smt2(e: &ElemExpr) -> String {
@@ -674,7 +686,7 @@ fn differential_array_vs_z3_when_available() {
             ArrAssertion::ArraysEqual(al.clone(), ar.clone()),
         ];
 
-        let mut smt2 = String::from("(set-logic QF_AX)\n");
+        let mut smt2 = String::from("(set-logic QF_ALIA)\n");
         for i in 0..nevars {
             smt2.push_str(&format!("(declare-fun e{} () Int)\n", i));
         }
@@ -706,12 +718,15 @@ fn differential_array_vs_z3_when_available() {
             None => continue,
         };
         let (claim, verdict) = solve_and_check_arrays(navars, nevars, &assertions, 200_000);
-        assert_eq!(
-            claim, z3_claim,
-            "disagreement with Z3 on AX problem (case {}):\n{}",
-            case, smt2
-        );
+        // `Unknown` is an honest "could not decide": the engine does no
+        // extensionality, so array equalities that differ only at an index no
+        // select reads stay undecided. Only a definite verdict must match Z3.
         if claim != SolveResult::Unknown {
+            assert_eq!(
+                claim, z3_claim,
+                "disagreement with Z3 on AX problem (case {}):\n{}",
+                case, smt2
+            );
             assert!(
                 verdict.is_accept(),
                 "checker did not Accept the AX verdict vs Z3: {:?}",
@@ -739,7 +754,7 @@ fn ax_z3_serialization_roundtrips_through_own_parser() {
             ArrAssertion::ArraysEqual(al.clone(), ar.clone()),
         ];
 
-        let mut smt2 = String::from("(set-logic QF_AX)\n");
+        let mut smt2 = String::from("(set-logic QF_ALIA)\n");
         for i in 0..nevars {
             smt2.push_str(&format!("(declare-fun e{} () Int)\n", i));
         }
