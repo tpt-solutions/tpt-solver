@@ -19,6 +19,11 @@ use crate::reference::Problem;
 use std::error::Error;
 use std::fmt;
 
+/// Largest variable count accepted. The solver and checker allocate per-variable
+/// state up front, so an unbounded count (e.g. a literal near `i32::MAX`) would
+/// exhaust memory before any search starts.
+pub const MAX_VARIABLES: u32 = 10_000_000;
+
 /// Error produced while parsing a DIMACS CNF stream.
 #[derive(Debug)]
 pub enum DimacsError {
@@ -28,6 +33,8 @@ pub enum DimacsError {
     InvalidHeader,
     /// A non-integer token appeared where an integer was expected.
     ExpectedInteger(std::num::ParseIntError),
+    /// The header or a literal declares more than [`MAX_VARIABLES`] variables.
+    TooManyVariables(u32),
 }
 
 impl fmt::Display for DimacsError {
@@ -39,6 +46,11 @@ impl fmt::Display for DimacsError {
                 "DIMACS: invalid problem line (expected 'p cnf <vars> <clauses>')"
             ),
             DimacsError::ExpectedInteger(e) => write!(f, "DIMACS: expected integer literal: {}", e),
+            DimacsError::TooManyVariables(n) => write!(
+                f,
+                "DIMACS: {} variables exceeds the limit of {}",
+                n, MAX_VARIABLES
+            ),
         }
     }
 }
@@ -73,6 +85,9 @@ pub fn parse_dimacs(input: &str) -> Result<Problem, DimacsError> {
                 return Err(DimacsError::InvalidHeader);
             }
             var_count = parts[2].parse()?;
+            if var_count > MAX_VARIABLES {
+                return Err(DimacsError::TooManyVariables(var_count));
+            }
             // The clause count in the header is informational; we derive the true
             // count from the terminators actually present.
             header_seen = true;
@@ -93,6 +108,9 @@ pub fn parse_dimacs(input: &str) -> Result<Problem, DimacsError> {
                 }
                 if v > var_count {
                     // Lenient: grow the declared count rather than reject.
+                    if v > MAX_VARIABLES {
+                        return Err(DimacsError::TooManyVariables(v));
+                    }
                     var_count = v;
                 }
                 current.push(lit);
@@ -153,5 +171,19 @@ mod tests {
     fn rejects_garbage_token() {
         let input = "p cnf 1 1\nx 0\n";
         assert!(parse_dimacs(input).is_err());
+    }
+
+    #[test]
+    fn rejects_variable_count_over_limit() {
+        let header = format!("p cnf {} 0\n", MAX_VARIABLES + 1);
+        assert!(matches!(
+            parse_dimacs(&header),
+            Err(DimacsError::TooManyVariables(_))
+        ));
+        let literal = format!("{} 0\n", i32::MAX);
+        assert!(matches!(
+            parse_dimacs(&literal),
+            Err(DimacsError::TooManyVariables(_))
+        ));
     }
 }
