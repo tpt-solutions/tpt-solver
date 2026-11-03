@@ -99,9 +99,8 @@ impl Solver<Solving> {
         self.fuel
     }
 
-    // The decision/search routine is intentionally not implemented here: it is the
-    // Phase 2 CDCL engine. For now the skeleton only establishes identity, typing,
-    // and lifecycle.
+    // The search itself lives in `sat.rs` (CDCL) and the theory modules. This type
+    // only carries identity, typing, and lifecycle; it does not run a search.
 }
 
 /// A satisfying assignment is a sequence of literals forced true by the model.

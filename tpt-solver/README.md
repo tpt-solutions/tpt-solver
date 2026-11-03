@@ -43,8 +43,8 @@ tpt-solver --bench         # offline random 3-SAT ladder through the certified p
 ```
 
 Every printed verdict is what the trusted checker (`tpt-solver-check`) returned — that is the
-only answer that may be trusted. A richer `clap`-based CLI (`--help`/`--version`,
-`--emit-proof`, `--explain`) is planned for a later phase.
+only answer that may be trusted. The CLI is `clap`-based and has `--help`,
+`--version`, `--emit-proof` and `--explain`.
 
 ## Usage as a library
 
@@ -56,7 +56,7 @@ tpt-solver = "0.1"
 ```rust
 use tpt_solver::reference::solve_and_check_cdcl;
 use tpt_solver::parsers::dimacs::parse_dimacs;
-use tpt_solver::engine::SolveResult;
+use tpt_solver::core::engine::SolveResult;
 use tpt_solver::check::outcome::Outcome;
 
 let input = "p cnf 3 4\n1 2 0\n-1 3 0\n-2 3 0\n-3 0";
@@ -78,8 +78,8 @@ assert_eq!(verdict, Outcome::Accept);
 cargo build -p tpt-solver
 cargo test  -p tpt-solver
 
-# Differential lane vs Z3 (no-ops if `z3` is not on PATH, so offline runs stay green):
-cargo test  -p tpt-solver
+# The Z3 differential lanes run inside `cargo test -p tpt-solver` and no-op if `z3`
+# is not on PATH, so offline runs stay green.
 ```
 
 ## License

@@ -23,7 +23,7 @@ Solutions.
 - [x] `README.md` with project summary + license section
 - [x] `#![deny(clippy::unwrap_used, clippy::panic)]` lint gate on
       `tpt-solver-core`
-- [x] CI workflow skeleton (placeholder job, filled in during Phase 1)
+- [x] CI workflow skeleton (filled in during Phase 1)
 
 ## Phase 1 — Foundation (Months 1–2)
 
@@ -123,9 +123,8 @@ Solutions.
       their variables (truth-table equivalence), plus targeted unit tests for
       individual rewrites (double-negation, annihilators, etc).
 - [x] CLI and I/O: `tpt-solver` binary parses a `.cnf`, solves with CDCL, and
-      prints the checker-validated verdict (`--fuel N` supported). `clap` is the
-      spec's intended dependency but a dependency-free arg parser is used for now
-      to keep the build offline-friendly.
+      prints the checker-validated verdict (`--fuel N` supported). Argument parsing
+      uses `clap` (derive), adopted in Phase 6.
 - [x] Tiered live-request fallback policy (`tpt-solver/src/policy.rs`): fail-closed,
       reseed-and-recheck on rejected SAT, fall back to the simpler reference DPLL,
       `Unknown` as the true last resort. `solve_certified` implements the pipeline.
@@ -305,11 +304,75 @@ tooling audits did find. All items below are done.
       engine-level clause-provenance tracking (RUP hints aren't populated yet) and
       remains out of scope.
 
-Also found in passing (not fixed — pre-existing, unrelated to this phase's scope,
-and not part of the working tree's own uncommitted in-progress edits): `cargo
-clippy --workspace --all-targets -- -D warnings` (the exact command the
-`build-and-test` CI job runs) currently fails on `tpt-solver-core/src/array.rs`,
-`tpt-solver-check/src/array.rs`, `tpt-solver/src/egraph.rs`, and
-`tpt-solver/src/parsers/mps.rs` (`comparison_chain`, `manual_strip`,
-`redundant_closure` ×2, `map_entry`). None of these files were touched by this
-phase's changes.
+Also found in passing: `cargo clippy --workspace --all-targets -- -D warnings`
+(the exact command the `build-and-test` CI job runs) failed on several array and
+egraph/MPS lints. Those are fixed; the command is clean as of Phase 7.
+
+## Phase 7 — Gap fixes, CLI/library ergonomics, packaging, adoption tooling (2026-11-04)
+
+Plan: `C:\Users\Phillip\.claude\plans\review-project-fix-any-vivid-quokka.md`.
+
+### 7a — Fixes
+- [x] Heap unit/proptest in `sat.rs` (decide order matches old argmax); commit the
+      VSIDS-heap diff.
+- [x] DIMACS fuzz seed with a huge-variable header (`fuzz/corpus/dimacs`); commit the
+      `MAX_VARIABLES` / `TooManyVariables` diff. (The `fuzz/corpus` directory is
+      git-ignored, so the seed was force-added.)
+- [x] `main.rs`: QF_BV "--emit-proof/--explain not supported" note printed for any
+      non-Sat result; now only for Unsat.
+- [x] Removed invalid `changelog` manifest key (core, check, tpt-solver, fuzz).
+- [x] SMT-LIB2: return `Unsupported` for `push`/`pop`/`reset`/`define-fun`/
+      `define-sort`/`declare-sort`/`check-sat-assuming`/`get-value` (previously silent
+      no-ops that can give wrong answers); error on malformed `declare-*` and
+      `(assert)` with no body.
+- [x] Replace `panic!` in `egraph.rs` (unknown rewrite operator) with a typed error;
+      the built-in rule table is now fallible (`rules() -> Result`). `reference.rs`'s
+      `.expect` on a zero literal is kept as a documented `Problem` invariant (the
+      parsers never produce one; fields are public, so hand-built problems can still
+      trip it).
+- [x] Size caps: DIMACS clause count (`MAX_CLAUSES`) and clause length
+      (`MAX_CLAUSE_LEN`); MPS columns and SMT-LIB2 declared symbols capped at the
+      same `MAX_VARIABLES`. Not capped: SMT-LIB2 Tseitin auxiliary variables, which
+      grow with formula size and need a term-size limit instead.
+- [x] Stale text: `engine.rs` "not implemented" comment; both READMEs (broken
+      `tpt_solver::engine::SolveResult` snippet, "clap CLI planned", missing
+      `--emit-proof/--explain`, "no release binaries", duplicated test command);
+      `todo.md` placeholder/arg-parser/clippy-failing notes (Phases 0, 4, 6).
+
+### 7b — Acknowledged feature gaps
+- [ ] `--emit-proof` with `--parallel` (portfolio returns the winner's proof).
+- [ ] `--emit-proof` for QF_BV (reuse the proof passed to `check_bv_unsat`).
+- [ ] CNF `--explain`: clause IDs/antecedents in `sat.rs::analyze`, emit hints.
+- [ ] Array disequalities / extensionality (core + check).
+- [ ] Document in `--help` that MPS is feasibility-only (objective dropped).
+
+### 7c — CLI and library ergonomics
+- [ ] Single `run() -> Result<ExitCode, CliError>`; remove scattered `process::exit`.
+- [ ] Content-based format detection, `--format`, stdin (`-`), `.gz` input.
+- [ ] `--output {human,json,competition}`; competition mode `s`/`v` lines with exit
+      codes 10/20/0; `--model`, `--timeout`, `-v/-q`, `--stats`; line/col parse errors.
+- [ ] Subcommands: `check <problem> <proof>`, `bench` (CSV), `completions <shell>`,
+      man page (clap_mangen).
+- [ ] Library: `prelude`, `solve_file`/`solve_str` -> `Result<Report, Error>` with a
+      unified `Error`; optional `serde` feature; `#![warn(missing_docs)]`; more examples.
+- [ ] Document the proof format exactly (LRAT vs DRAT); cross-check with `drat-trim`.
+
+### 7d — Packaging and CI
+- [ ] `version = "0.1.0"` on path deps; homepage/documentation/include; `cargo publish
+      --dry-run` CI job.
+- [ ] cargo-dist release (archives, checksums, linux-arm64/musl, macOS x86_64, install
+      scripts, binstall); GHCR `Dockerfile`; README badges.
+- [ ] CI: Windows/macOS matrix, blocking `cargo-deny`, `cargo doc -D warnings`, `no_std`
+      build of core/check, Kani on `tpt-solver-check`, rust-cache, Dependabot.
+- [ ] `CONTRIBUTING.md`, `SECURITY.md`, root `CHANGELOG.md`, issue/PR templates; move
+      `spec.txt`/`todo.md` to `docs/internal/`.
+
+### 7e — Adoption tooling
+- [ ] WASM playground: `tpt-solver-wasm` crate + static page deployed to GitHub Pages.
+- [ ] Python bindings: `tpt-solver-py` (PyO3/maturin) with `solve_cnf`, `solve_smt2`,
+      `check_proof`; PyPI publish job.
+- [ ] Benchmark harness: criterion benches, `bench/` runner + small corpus, comparison
+      vs minisat/Z3, nightly regression job, `cargo llvm-cov`.
+- [ ] Docs site (mdBook): trust model, format/feature matrix, proof formats, fuel vs
+      timeout, FAQ; deploy to Pages.
+- [ ] Still open from Phase 6: SAT-COMP / SMT-COMP benchmark run.

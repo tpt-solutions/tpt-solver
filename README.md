@@ -34,8 +34,9 @@ proofs, checked by tools like `drat-trim` and the machine-verified `cake_lpr`).
 
 ## Status
 
-Phases 0–5 (SAT/LRA/BV/array theories, certificate checking, parsers, portfolio
-solving) are complete; see `todo.md` for the full phased plan and what's left.
+Phases 0–6 (SAT/LRA/BV/array theories, certificate checking, parsers, portfolio
+solving, CLI proof and core export flags) are complete; Phase 7 is in progress. See
+`todo.md` for the full phased plan and what's left.
 
 ## Building and testing
 
@@ -50,9 +51,9 @@ cargo test  --workspace
 cargo install --path tpt-solver
 ```
 
-This builds the `tpt-solver` binary from source (no crates.io publish yet, no
-prebuilt release binaries other than what the `release` GitHub Actions workflow
-attaches to tagged releases).
+This builds the `tpt-solver` binary from source. There is no crates.io release
+yet. Prebuilt binaries for Linux, macOS and Windows are attached to tagged
+(`v*`) GitHub Releases by the `release` workflow.
 
 ## CLI usage
 
