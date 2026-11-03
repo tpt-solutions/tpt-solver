@@ -16,7 +16,9 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
-use tpt_solver_core::array::{ArrAssertion, ArrayExpr, ArrayModel, AxFact, ElemExpr};
+use tpt_solver_core::array::{
+    ArrAssertion, ArrayExpr, ArrayModel, AxFact, ConcreteArray, Disequality, ElemExpr,
+};
 
 /// Maximum accepted term depth; deeper inputs are [`Outcome::Inconclusive`].
 const MAX_DEPTH: u32 = 2048;
@@ -56,6 +58,17 @@ fn eval_array(
     }
 }
 
+/// Whether two concrete arrays denote the same function on the whole index
+/// universe. Entries equal to the default are dropped first, because they do not
+/// change the content.
+fn same_content(a: &ConcreteArray, b: &ConcreteArray) -> bool {
+    a.default == b.default
+        && a.entries
+            .iter()
+            .filter(|(_, v)| *v != a.default)
+            .eq(b.entries.iter().filter(|(_, v)| *v != b.default))
+}
+
 /// Verify a claimed SAT model by substituting it into every assertion.
 pub fn check_array_model(
     assertions: &[ArrAssertion],
@@ -78,7 +91,19 @@ pub fn check_array_model(
                 let (Some(x), Some(y)) = (eval_array(l, model, 0), eval_array(r, model, 0)) else {
                     return Outcome::Inconclusive;
                 };
-                x == y
+                same_content(&x, &y)
+            }
+            ArrAssertion::ElemsDistinct(l, r) => {
+                let (Some(x), Some(y)) = (eval_elem(l, model, 0), eval_elem(r, model, 0)) else {
+                    return Outcome::Inconclusive;
+                };
+                x != y
+            }
+            ArrAssertion::ArraysDistinct(l, r) => {
+                let (Some(x), Some(y)) = (eval_array(l, model, 0), eval_array(r, model, 0)) else {
+                    return Outcome::Inconclusive;
+                };
+                !same_content(&x, &y)
             }
         };
         if !ok {
@@ -288,6 +313,19 @@ fn apply(k: &mut KernelAx, f: &AxFact) -> Option<bool> {
     }
 }
 
+/// Whether `clash` matches one of the input disequalities, in either orientation.
+fn asserted_distinct(assertions: &[ArrAssertion], clash: &Disequality) -> bool {
+    assertions.iter().any(|a| match (a, clash) {
+        (ArrAssertion::ElemsDistinct(a1, a2), Disequality::Elems(c1, c2)) => {
+            (a1 == c1 && a2 == c2) || (a1 == c2 && a2 == c1)
+        }
+        (ArrAssertion::ArraysDistinct(a1, a2), Disequality::Arrays(c1, c2)) => {
+            (a1 == c1 && a2 == c2) || (a1 == c2 && a2 == c1)
+        }
+        _ => false,
+    })
+}
+
 /// Replay an UNSAT certificate against the original assertions.
 ///
 /// [`Outcome::Accept`] iff the facts all validate locally and some element
@@ -315,6 +353,8 @@ pub fn check_ax_unsat(
                 k.unite(x, y);
                 true
             }
+            // Disequalities do not merge classes; they are checked after replay.
+            ArrAssertion::ElemsDistinct(..) | ArrAssertion::ArraysDistinct(..) => true,
         };
         if !ok {
             return Outcome::Inconclusive;
@@ -347,6 +387,37 @@ pub fn check_ax_unsat(
         // A fact that never became applicable means the engine's derivation
         // does not replay — reject rather than accept.
         return Outcome::Reject;
+    }
+
+    // Disequality clash: the certificate names an asserted disequality, and its
+    // two sides must now lie in one class. A name that is not an input assertion
+    // is a fabricated claim, so it is rejected.
+    if let Some(clash) = &cert.clash {
+        if !asserted_distinct(assertions, clash) {
+            return Outcome::Reject;
+        }
+        return match clash {
+            Disequality::Elems(l, r) => {
+                let (Some(x), Some(y)) = (k.ie(l, 0), k.ie(r, 0)) else {
+                    return Outcome::Inconclusive;
+                };
+                if k.find(x) == k.find(y) {
+                    Outcome::Accept
+                } else {
+                    Outcome::Reject
+                }
+            }
+            Disequality::Arrays(l, r) => {
+                let (Some(x), Some(y)) = (k.ia(l, 0), k.ia(r, 0)) else {
+                    return Outcome::Inconclusive;
+                };
+                if k.find(x) == k.find(y) {
+                    Outcome::Accept
+                } else {
+                    Outcome::Reject
+                }
+            }
+        };
     }
 
     // Clash: one class holding two distinct constants (constants are tracked
@@ -419,6 +490,7 @@ mod tests {
         let bogus = ElemExpr::select(av(0), ev(0));
         let cert = tpt_solver_core::array::AxCertificate {
             facts: vec![AxFact::SelectOfStoreIsIndex { select: bogus }],
+            clash: None,
         };
         assert!(check_ax_unsat(&asserts, &cert).is_inconclusive());
     }
@@ -437,6 +509,7 @@ mod tests {
                     right: ElemExpr::select(av(0), k(2)),
                 },
             ],
+            clash: None,
         };
         assert!(check_ax_unsat(&asserts, &cert).is_reject());
     }
@@ -449,5 +522,79 @@ mod tests {
             elems: Vec::new(),
         };
         assert!(check_array_model(&asserts, &model, 2, 0).is_inconclusive());
+    }
+
+    #[test]
+    fn model_violating_a_disequality_is_rejected() {
+        let asserts = vec![ArrAssertion::ArraysDistinct(av(0), av(1))];
+        let same = ArrayModel {
+            arrays: vec![
+                tpt_solver_core::array::ConcreteArray::constant(0),
+                tpt_solver_core::array::ConcreteArray::constant(0),
+            ],
+            elems: Vec::new(),
+        };
+        assert!(check_array_model(&asserts, &same, 2, 0).is_reject());
+        let apart = ArrayModel {
+            arrays: vec![
+                tpt_solver_core::array::ConcreteArray::constant(0),
+                tpt_solver_core::array::ConcreteArray::constant(1),
+            ],
+            elems: Vec::new(),
+        };
+        assert!(check_array_model(&asserts, &apart, 2, 0).is_accept());
+    }
+
+    #[test]
+    fn equal_content_with_redundant_entry_is_accepted() {
+        // Same function, different entry lists: the kernel must not reject it.
+        use tpt_solver_core::array::ConcreteArray;
+        let asserts = vec![ArrAssertion::ArraysEqual(av(0), av(1))];
+        let model = ArrayModel {
+            arrays: vec![
+                ConcreteArray::constant(0),
+                ConcreteArray {
+                    default: 0,
+                    entries: vec![(3, 0)],
+                },
+            ],
+            elems: Vec::new(),
+        };
+        assert!(check_array_model(&asserts, &model, 2, 0).is_accept());
+    }
+
+    #[test]
+    fn genuine_disequality_clash_is_accepted() {
+        let asserts = vec![
+            ArrAssertion::ElemsEqual(ev(0), ev(1)),
+            ArrAssertion::ElemsDistinct(ev(0), ev(1)),
+        ];
+        let cert = tpt_solver_core::array::AxCertificate {
+            facts: Vec::new(),
+            clash: Some(tpt_solver_core::array::Disequality::Elems(ev(0), ev(1))),
+        };
+        assert!(check_ax_unsat(&asserts, &cert).is_accept());
+    }
+
+    #[test]
+    fn fabricated_disequality_clash_is_rejected() {
+        // The named disequality was never asserted: a fabricated claim.
+        let asserts = vec![ArrAssertion::ElemsEqual(ev(0), ev(1))];
+        let cert = tpt_solver_core::array::AxCertificate {
+            facts: Vec::new(),
+            clash: Some(tpt_solver_core::array::Disequality::Elems(ev(0), ev(1))),
+        };
+        assert!(check_ax_unsat(&asserts, &cert).is_reject());
+    }
+
+    #[test]
+    fn asserted_disequality_whose_sides_stay_apart_is_rejected() {
+        // The disequality is real, but nothing merges its sides, so it is no clash.
+        let asserts = vec![ArrAssertion::ElemsDistinct(ev(0), ev(1))];
+        let cert = tpt_solver_core::array::AxCertificate {
+            facts: Vec::new(),
+            clash: Some(tpt_solver_core::array::Disequality::Elems(ev(0), ev(1))),
+        };
+        assert!(check_ax_unsat(&asserts, &cert).is_reject());
     }
 }

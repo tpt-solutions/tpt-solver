@@ -1,11 +1,11 @@
 //! QF_AX array theory — ground arrays with positive equalities (Phase 5).
 //!
-//! Fragment: conjunctions of *equalities* between element terms
-//! ([`ElemExpr`]: variables, constants, `select`) and array terms
-//! ([`ArrayExpr`]: array variables, constant arrays, `store`). There are no
-//! disequalities yet — see the todo notes; with positive equalities alone,
-//! unsatisfiability always manifests as two **distinct constants** being
-//! proven equal, which is exactly the shape the certificate captures.
+//! Fragment: conjunctions of *equalities* and *disequalities* between element
+//! terms ([`ElemExpr`]: variables, constants, `select`) and array terms
+//! ([`ArrayExpr`]: array variables, constant arrays, `store`). Disequalities never
+//! feed the partition. An UNSAT either forces two distinct constants equal, or merges
+//! the two sides of an asserted disequality, and the certificate says which
+//! ([`AxCertificate::clash`]).
 //!
 //! Decision procedure: congruence closure modulo the select-over-store axioms,
 //! fuel-bounded:
@@ -36,7 +36,7 @@
 //! input yields `None` ("could not decide"), never a panic.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 /// An element-sorted term: variables/constants, or a selection out of an
@@ -62,13 +62,21 @@ pub enum ArrayExpr {
     Store(Box<ArrayExpr>, Box<ElemExpr>, Box<ElemExpr>),
 }
 
-/// An assertion of the array problem (positive equalities only).
+/// An assertion of the array problem.
+///
+/// Equalities and disequalities between element terms and between array terms.
+/// Arrays range over an unbounded index universe, so two arrays are distinct
+/// exactly when they differ at some index (extensionality).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ArrAssertion {
     /// Two element terms are equal.
     ElemsEqual(ElemExpr, ElemExpr),
     /// Two array terms are equal.
     ArraysEqual(ArrayExpr, ArrayExpr),
+    /// Two element terms are different.
+    ElemsDistinct(ElemExpr, ElemExpr),
+    /// Two array terms are different (differ at some index).
+    ArraysDistinct(ArrayExpr, ArrayExpr),
 }
 
 impl ElemExpr {
@@ -136,6 +144,20 @@ impl ConcreteArray {
         }
         out
     }
+
+    /// Whether two arrays denote the same function on the whole index universe.
+    ///
+    /// Structural `==` is not enough: an entry that repeats the default value
+    /// changes the entry list without changing the content. Entries equal to the
+    /// default are dropped before comparing.
+    pub fn same_content(&self, other: &ConcreteArray) -> bool {
+        self.default == other.default
+            && self
+                .entries
+                .iter()
+                .filter(|(_, v)| *v != self.default)
+                .eq(other.entries.iter().filter(|(_, v)| *v != other.default))
+    }
 }
 
 /// A claimed model: one concrete array per array variable, one value per
@@ -198,7 +220,13 @@ pub fn assertions_hold(assertions: &[ArrAssertion], model: &ArrayModel) -> Optio
     for a in assertions {
         let ok = match a {
             ArrAssertion::ElemsEqual(l, r) => eval_elem(l, model)? == eval_elem(r, model)?,
-            ArrAssertion::ArraysEqual(l, r) => eval_array(l, model)? == eval_array(r, model)?,
+            ArrAssertion::ArraysEqual(l, r) => {
+                eval_array(l, model)?.same_content(&eval_array(r, model)?)
+            }
+            ArrAssertion::ElemsDistinct(l, r) => eval_elem(l, model)? != eval_elem(r, model)?,
+            ArrAssertion::ArraysDistinct(l, r) => {
+                !eval_array(l, model)?.same_content(&eval_array(r, model)?)
+            }
         };
         if !ok {
             return Some(false);
@@ -249,13 +277,27 @@ pub enum AxFact {
     },
 }
 
-/// UNSAT evidence: the axiom instances used by the closure. The engine replays
-/// this list with its own naive mirror of the checker's rules before claiming
-/// `Unsat`.
+/// The disequality that the derivation contradicts: its two sides end up in one
+/// class. Carried by value so the checker can match it against the input
+/// assertions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Disequality {
+    /// An element disequality `l != r`.
+    Elems(ElemExpr, ElemExpr),
+    /// An array disequality `l != r`.
+    Arrays(ArrayExpr, ArrayExpr),
+}
+
+/// UNSAT evidence: the axiom instances used by the closure, and optionally the
+/// asserted disequality they contradict. The engine replays this list with its own
+/// naive mirror of the checker's rules before claiming `Unsat`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AxCertificate {
     /// Axiom instances, in derivation order.
     pub facts: Vec<AxFact>,
+    /// `Some` when the contradiction is a disequality whose sides were merged.
+    /// `None` when it is two distinct constants forced equal.
+    pub clash: Option<Disequality>,
 }
 
 /// The engine's array-theory answer with its certificate.
@@ -587,11 +629,19 @@ fn apply_congruent_selects(cl: &mut Closure, left: &ElemExpr, right: &ElemExpr) 
     true
 }
 
-/// Naive replay of `facts` over a fresh partition seeded with the forced
-/// unions; returns `true` iff some class ends holding two distinct constants.
-/// The engine runs this mirror of the kernel's algorithm before it may claim
-/// `Unsat`, so only certificates that genuinely replay to a clash ship.
-fn replay_finds_clash(cl: &mut Closure, forced: &[(usize, usize)], facts: &[AxFact]) -> bool {
+/// Naive replay of `facts` over a fresh partition seeded with the forced unions.
+///
+/// Returns `None` when no contradiction is reached, `Some(None)` when some class
+/// ends holding two distinct constants, and `Some(Some(i))` when the `i`-th
+/// disequality in `diseqs` has both sides in one class. The engine runs this
+/// mirror of the kernel's algorithm before it may claim `Unsat`, so only
+/// certificates that genuinely replay to a clash ship.
+fn replay_clash(
+    cl: &mut Closure,
+    forced: &[(usize, usize)],
+    facts: &[AxFact],
+    diseqs: &[(usize, usize)],
+) -> Option<Option<usize>> {
     cl.reset_uf();
     let mut clash = false;
     for &(x, y) in forced {
@@ -615,6 +665,12 @@ fn replay_finds_clash(cl: &mut Closure, forced: &[(usize, usize)], facts: &[AxFa
             break;
         }
     }
+    // The kernel rejects any certificate with a fact that never applies, so the
+    // mirror must reject it too. Otherwise the engine could claim an UNSAT that the
+    // checker refuses.
+    if consumed.iter().any(|&c| !c) {
+        return None;
+    }
     if !clash {
         // Clash scan: two distinct constant kinds in one class.
         'scan: for c in 0..cl.kinds.len() {
@@ -632,7 +688,11 @@ fn replay_finds_clash(cl: &mut Closure, forced: &[(usize, usize)], facts: &[AxFa
             }
         }
     }
-    clash
+    if clash {
+        return Some(None);
+    }
+    let hit = diseqs.iter().position(|&(x, y)| cl.find(x) == cl.find(y));
+    hit.map(Some)
 }
 
 /// Decide a conjunction of ground array equalities.
@@ -655,6 +715,11 @@ pub fn solve_arrays(
     }
 
     let mut forced: Vec<(usize, usize)> = Vec::new();
+    // Disequalities never feed the partition. They are checked after each closure,
+    // and a merged pair is a clash. `diseq_terms[i]` names the i-th pair for the
+    // certificate.
+    let mut diseqs: Vec<(usize, usize)> = Vec::new();
+    let mut diseq_terms: Vec<Disequality> = Vec::new();
     for a in assertions {
         match a {
             ArrAssertion::ElemsEqual(l, r) => {
@@ -666,6 +731,18 @@ pub fn solve_arrays(
                 let x = cl.intern_array(l, 0)?;
                 let y = cl.intern_array(r, 0)?;
                 forced.push((x, y));
+            }
+            ArrAssertion::ElemsDistinct(l, r) => {
+                let x = cl.intern_elem(l, 0)?;
+                let y = cl.intern_elem(r, 0)?;
+                diseqs.push((x, y));
+                diseq_terms.push(Disequality::Elems(l.clone(), r.clone()));
+            }
+            ArrAssertion::ArraysDistinct(l, r) => {
+                let x = cl.intern_array(l, 0)?;
+                let y = cl.intern_array(r, 0)?;
+                diseqs.push((x, y));
+                diseq_terms.push(Disequality::Arrays(l.clone(), r.clone()));
             }
         }
     }
@@ -720,7 +797,7 @@ pub fn solve_arrays(
                 match cl.kinds[prep] {
                     Kind::ConstArr(vc) => {
                         if cl.find(s) != cl.find(vc) {
-                            let st = cl.eterm.get(&s).cloned()?;
+                            let st = literal_select(&cl, prep, jc)?;
                             facts.push(AxFact::SelectOfConstArray { select: st });
                             clash = cl.unite(s, vc);
                             changed = true;
@@ -731,14 +808,14 @@ pub fn solve_arrays(
                         let fj = cl.find(jc);
                         if fi == fj {
                             if cl.find(s) != cl.find(vc) {
-                                let st = cl.eterm.get(&s).cloned()?;
+                                let st = literal_select(&cl, prep, jc)?;
                                 facts.push(AxFact::SelectOfStoreIsIndex { select: st });
                                 clash = cl.unite(s, vc);
                                 changed = true;
                             }
                         } else {
                             let (Some(st), Some(bt), Some(jt)) = (
-                                cl.eterm.get(&s).cloned(),
+                                literal_select(&cl, prep, jc),
                                 cl.aterm.get(&b).cloned(),
                                 cl.eterm.get(&jc).cloned(),
                             ) else {
@@ -783,9 +860,17 @@ pub fn solve_arrays(
             }
         }
 
+        if diseqs.iter().any(|&(x, y)| cl.find(x) == cl.find(y)) {
+            clash = true;
+        }
+
         if clash {
-            if replay_finds_clash(&mut cl, &combined, &facts) {
-                return Some(AxOutcome::Unsat(AxCertificate { facts }));
+            if let Some(hit) = replay_clash(&mut cl, &combined, &facts, &diseqs) {
+                let clash_term = hit.map(|i| diseq_terms[i].clone());
+                return Some(AxOutcome::Unsat(AxCertificate {
+                    facts,
+                    clash: clash_term,
+                }));
             }
             // Ban invalidated walkthrough assumptions and retry.
             let mut added = false;
@@ -818,6 +903,18 @@ pub fn solve_arrays(
         }
     }
     build_model(&mut cl, avar_count, evar_count, &selects, &reg, assertions).map(AxOutcome::Sat)
+}
+
+/// The literal `select(A, J)` a fact must name, where `A` is the canonical array term
+/// of the class representative `arr_cell` (the `store` or `constarray` whose rule
+/// fires) and `J` the index term. The checker requires the array argument of a
+/// fact's select to be that literal term, so a select cell whose own array is merely
+/// equal to a store cannot be used directly.
+fn literal_select(cl: &Closure, arr_cell: usize, idx_cell: usize) -> Option<ElemExpr> {
+    Some(ElemExpr::Select(
+        Box::new(cl.aterm.get(&arr_cell)?.clone()),
+        Box::new(cl.eterm.get(&idx_cell)?.clone()),
+    ))
 }
 
 /// Index pair `(i, j)` whose distinctness a walkthrough fact assumed, used by
@@ -871,8 +968,17 @@ fn congrue(
 }
 
 /// Extract a concrete model from the clash-free closure and self-check it.
-/// Returns `None` when any residual inconsistency remains — degraded to
-/// "could not decide", never a wrong `Sat`.
+///
+/// Every element class gets one value: its constant if it has one, otherwise a
+/// fresh value. Fresh values are distinct from each other and from every constant.
+/// Every array class gets a default: that of its constant-array member if it has
+/// one, otherwise that of its store base (followed through the chain), otherwise a
+/// fresh value. Two array classes with different defaults differ at every index
+/// outside their finitely many entries, so asserted disequalities between them hold.
+/// Where a disequality is not satisfied, the self-check below fails and the answer
+/// is "could not decide", never a wrong `Sat`.
+///
+/// Returns `None` on any inconsistency.
 fn build_model(
     cl: &mut Closure,
     avar_count: u32,
@@ -881,11 +987,17 @@ fn build_model(
     sel_reg: &BTreeMap<(usize, usize), usize>,
     assertions: &[ArrAssertion],
 ) -> Option<ArrayModel> {
-    // Element variable values: their class constant if any, else 0.
+    let elem_val = elem_values(cl);
+    let arr_default = array_defaults(cl, &elem_val)?;
+
+    // Element variable values: their class value.
     let mut elems: Vec<u64> = Vec::with_capacity(evar_count as usize);
     for id in 0..evar_count as usize {
         let v = match cl.evar_cell.get(id).copied().flatten() {
-            Some(c) => cl.root_val(c).unwrap_or(0),
+            Some(c) => {
+                let r = cl.find(c);
+                *elem_val.get(&r)?
+            }
             None => 0,
         };
         elems.push(v);
@@ -907,7 +1019,7 @@ fn build_model(
             ArrayExpr::AVar(_) => {
                 let ar = cl.find(ac);
                 let ir = cl.find(jc);
-                let v = cl.root_val(s).unwrap_or(0);
+                let v = *elem_val.get(&cl.find(s))?;
                 req.entry(ar).or_default().insert(ir, v);
                 resolved.insert(s, ());
             }
@@ -932,39 +1044,24 @@ fn build_model(
         }
     }
 
-    // Concrete members per element-class root (constants + chosen var values).
-    let mut members_of: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
-    for c in 0..cl.kinds.len() {
-        match cl.kinds[c] {
-            Kind::EConst(v) => members_of.entry(cl.find(c)).or_default().push(v),
-            Kind::EVar(id) => {
-                if let Some(&val) = elems.get(id as usize) {
-                    members_of.entry(cl.find(c)).or_default().push(val);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Materialize arrays; array-equal variables share a class root, hence
-    // identical content.
+    // Materialize arrays. Array-equal variables share a class root, so they share
+    // default and content.
     let mut arrays: Vec<ConcreteArray> = Vec::with_capacity(avar_count as usize);
     for id in 0..avar_count as usize {
         let mut entries_map: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut default = 0;
         if let Some(Some(cell)) = cl.avar_cell.get(id).copied() {
             let r = cl.find(cell);
+            default = *arr_default.get(&r)?;
             if let Some(m) = req.get(&r) {
                 for (ir, v) in m {
-                    if let Some(members) = members_of.get(ir) {
-                        for mem in members {
-                            entries_map.insert(*mem, *v);
-                        }
-                    }
+                    let index_value = *elem_val.get(ir)?;
+                    entries_map.insert(index_value, *v);
                 }
             }
         }
         arrays.push(ConcreteArray {
-            default: 0,
+            default,
             entries: entries_map.into_iter().collect(),
         });
     }
@@ -975,6 +1072,132 @@ fn build_model(
     } else {
         None
     }
+}
+
+/// Smallest value not in `used`, advancing the counter past it. Used to hand out
+/// values that are distinct from each other and from every constant.
+fn fresh_value(next: &mut u64, used: &BTreeSet<u64>) -> u64 {
+    while used.contains(next) {
+        *next = next.saturating_add(1);
+    }
+    let v = *next;
+    *next = next.saturating_add(1);
+    v
+}
+
+/// One value per element class root: its constant, or a fresh value.
+fn elem_values(cl: &mut Closure) -> BTreeMap<usize, u64> {
+    let mut used: BTreeSet<u64> = BTreeSet::new();
+    for kind in &cl.kinds {
+        if let Kind::EConst(v) = kind {
+            used.insert(*v);
+        }
+    }
+    let is_elem = |k: &Kind| matches!(k, Kind::EVar(_) | Kind::EConst(_) | Kind::Select(..));
+    let elem_cells: Vec<usize> = (0..cl.kinds.len())
+        .filter(|&c| is_elem(&cl.kinds[c]))
+        .collect();
+
+    let mut values: BTreeMap<usize, u64> = BTreeMap::new();
+    for &c in &elem_cells {
+        if let Some(v) = cl.root_val(c) {
+            let r = cl.find(c);
+            values.insert(r, v);
+        }
+    }
+    let mut next = 0u64;
+    for &c in &elem_cells {
+        let r = cl.find(c);
+        values
+            .entry(r)
+            .or_insert_with(|| fresh_value(&mut next, &used));
+    }
+    values
+}
+
+/// Where an array class's default comes from.
+#[derive(Clone, Copy)]
+enum DefaultBase {
+    /// The class holds a constant array with this default.
+    Const(u64),
+    /// The class holds a store whose base is the class with this root.
+    Store(usize),
+    /// Nothing fixes the default; a fresh value is chosen.
+    Fresh,
+}
+
+/// One default value per array class root (see [`build_model`]).
+fn array_defaults(
+    cl: &mut Closure,
+    elem_val: &BTreeMap<usize, u64>,
+) -> Option<BTreeMap<usize, u64>> {
+    let array_cells: Vec<usize> = (0..cl.kinds.len())
+        .filter(|&c| {
+            matches!(
+                cl.kinds[c],
+                Kind::AVar(_) | Kind::ConstArr(_) | Kind::Store(..)
+            )
+        })
+        .collect();
+
+    // Classify each class from its members: constant array first, then store.
+    let mut base: BTreeMap<usize, DefaultBase> = BTreeMap::new();
+    for &c in &array_cells {
+        if let Kind::ConstArr(vc) = cl.kinds[c] {
+            let r = cl.find(c);
+            let v = *elem_val.get(&cl.find(vc))?;
+            base.insert(r, DefaultBase::Const(v));
+        }
+    }
+    for &c in &array_cells {
+        if let Kind::Store(bc, _, _) = cl.kinds[c] {
+            let r = cl.find(c);
+            let br = cl.find(bc);
+            base.entry(r).or_insert(DefaultBase::Store(br));
+        }
+    }
+    for &c in &array_cells {
+        let r = cl.find(c);
+        base.entry(r).or_insert(DefaultBase::Fresh);
+    }
+
+    let mut used: BTreeSet<u64> = BTreeSet::new();
+    let mut memo: BTreeMap<usize, u64> = BTreeMap::new();
+    for (&r, b) in &base {
+        if let DefaultBase::Const(v) = b {
+            used.insert(*v);
+            memo.insert(r, *v);
+        }
+    }
+
+    let mut next = 0u64;
+    let roots: Vec<usize> = base.keys().copied().collect();
+    for start in roots {
+        if memo.contains_key(&start) {
+            continue;
+        }
+        // Follow store bases until a resolved class, a fresh class, or a cycle.
+        let mut path: Vec<usize> = Vec::new();
+        let mut cur = start;
+        let value = loop {
+            if let Some(&v) = memo.get(&cur) {
+                break v;
+            }
+            if path.contains(&cur) {
+                break fresh_value(&mut next, &used);
+            }
+            path.push(cur);
+            match *base.get(&cur)? {
+                DefaultBase::Store(next_root) => cur = next_root,
+                DefaultBase::Fresh => break fresh_value(&mut next, &used),
+                DefaultBase::Const(v) => break v,
+            }
+        };
+        for r in path {
+            memo.insert(r, value);
+        }
+    }
+    Some(memo)
 }
 
 #[cfg(test)]
@@ -1023,7 +1246,7 @@ mod tests {
                         forced.push((x, y));
                     }
                 }
-                assert!(replay_finds_clash(&mut cl, &forced, &cert.facts));
+                assert!(replay_clash(&mut cl, &forced, &cert.facts, &[]) == Some(None));
             }
             other => panic!("expected Unsat, got {:?}", other.is_some()),
         }
@@ -1106,5 +1329,97 @@ mod tests {
         let sel = ElemExpr::select(ArrayExpr::store(av(0), ev(0), k(5)), ev(0));
         let asserts = vec![ArrAssertion::ElemsEqual(sel, k(7))];
         assert!(solve_arrays(1, 1, &asserts, 0).is_none());
+    }
+
+    #[test]
+    fn unsat_array_disequality_of_merged_arrays() {
+        // a == b and a != b: the disequality's sides merge, so the certificate names it.
+        let asserts = vec![
+            ArrAssertion::ArraysEqual(av(0), av(1)),
+            ArrAssertion::ArraysDistinct(av(0), av(1)),
+        ];
+        match solve_arrays(2, 0, &asserts, 10_000) {
+            Some(AxOutcome::Unsat(cert)) => {
+                assert_eq!(
+                    cert.clash,
+                    Some(Disequality::Arrays(av(0), av(1))),
+                    "the clash must name the asserted disequality"
+                );
+            }
+            other => panic!("expected Unsat, got {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn unsat_element_disequality_of_merged_elements() {
+        let asserts = vec![
+            ArrAssertion::ElemsEqual(ev(0), ev(1)),
+            ArrAssertion::ElemsDistinct(ev(0), ev(1)),
+        ];
+        match solve_arrays(0, 2, &asserts, 10_000) {
+            Some(AxOutcome::Unsat(cert)) => {
+                assert_eq!(cert.clash, Some(Disequality::Elems(ev(0), ev(1))));
+            }
+            other => panic!("expected Unsat, got {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn sat_unconstrained_distinct_arrays_and_elements() {
+        // Nothing forces these equal, so the model must make them differ.
+        let asserts = vec![
+            ArrAssertion::ArraysDistinct(av(0), av(1)),
+            ArrAssertion::ElemsDistinct(ev(0), ev(1)),
+        ];
+        match solve_arrays(2, 2, &asserts, 10_000) {
+            Some(AxOutcome::Sat(m)) => {
+                assert!(assertions_hold(&asserts, &m) == Some(true));
+            }
+            other => panic!("expected Sat, got {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn sat_array_distinct_from_its_own_store() {
+        // a != store(a, 0, 5): a[0] must not be 5, and the default works.
+        let asserts = vec![ArrAssertion::ArraysDistinct(
+            av(0),
+            ArrayExpr::store(av(0), k(0), k(5)),
+        )];
+        match solve_arrays(1, 0, &asserts, 10_000) {
+            Some(AxOutcome::Sat(m)) => {
+                assert!(assertions_hold(&asserts, &m) == Some(true));
+            }
+            other => panic!("expected Sat, got {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn same_content_ignores_entries_equal_to_the_default() {
+        // store(a, 1, 0) with default 0 has the same content as a itself.
+        let plain = ConcreteArray::constant(0);
+        let redundant = ConcreteArray {
+            default: 0,
+            entries: alloc::vec![(1, 0)],
+        };
+        assert!(plain.same_content(&redundant));
+        assert_ne!(plain, redundant, "structural equality differs");
+        let different = ConcreteArray {
+            default: 0,
+            entries: alloc::vec![(1, 7)],
+        };
+        assert!(!plain.same_content(&different));
+    }
+
+    #[test]
+    fn fresh_defaults_keep_distinct_classes_apart() {
+        // Two unconstrained arrays get different defaults, so they differ.
+        let asserts = vec![ArrAssertion::ArraysDistinct(av(0), av(1))];
+        match solve_arrays(2, 0, &asserts, 10_000) {
+            Some(AxOutcome::Sat(m)) => {
+                assert!(m.arrays[0].default != m.arrays[1].default);
+            }
+            other => panic!("expected Sat, got {:?}", other.is_some()),
+        }
     }
 }

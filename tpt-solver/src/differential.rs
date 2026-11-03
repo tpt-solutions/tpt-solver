@@ -681,9 +681,15 @@ fn differential_array_vs_z3_when_available() {
         let er = gen_ax_elem(&mut rng, navars, nevars, 2);
         let al = gen_ax_arr(&mut rng, navars, nevars, 2);
         let ar = gen_ax_arr(&mut rng, navars, nevars, 2);
+        let dl = gen_ax_elem(&mut rng, navars, nevars, 2);
+        let dr = gen_ax_elem(&mut rng, navars, nevars, 2);
+        let dal = gen_ax_arr(&mut rng, navars, nevars, 2);
+        let dar = gen_ax_arr(&mut rng, navars, nevars, 2);
         let assertions = vec![
             ArrAssertion::ElemsEqual(el.clone(), er.clone()),
             ArrAssertion::ArraysEqual(al.clone(), ar.clone()),
+            ArrAssertion::ElemsDistinct(dl.clone(), dr.clone()),
+            ArrAssertion::ArraysDistinct(dal.clone(), dar.clone()),
         ];
 
         let mut smt2 = String::from("(set-logic QF_ALIA)\n");
@@ -695,6 +701,22 @@ fn differential_array_vs_z3_when_available() {
         }
         for a in &assertions {
             match a {
+                ArrAssertion::ElemsDistinct(l, r) => {
+                    smt2.push_str(&format!(
+                        "(assert (distinct {} {}))
+",
+                        ax_elem_to_smt2(l),
+                        ax_elem_to_smt2(r)
+                    ));
+                }
+                ArrAssertion::ArraysDistinct(l, r) => {
+                    smt2.push_str(&format!(
+                        "(assert (distinct {} {}))
+",
+                        ax_arr_to_smt2(l),
+                        ax_arr_to_smt2(r)
+                    ));
+                }
                 ArrAssertion::ElemsEqual(l, r) => {
                     smt2.push_str(&format!(
                         "(assert (= {} {}))\n",
@@ -749,9 +771,15 @@ fn ax_z3_serialization_roundtrips_through_own_parser() {
         let er = gen_ax_elem(&mut rng, navars, nevars, 2);
         let al = gen_ax_arr(&mut rng, navars, nevars, 2);
         let ar = gen_ax_arr(&mut rng, navars, nevars, 2);
+        let dl = gen_ax_elem(&mut rng, navars, nevars, 2);
+        let dr = gen_ax_elem(&mut rng, navars, nevars, 2);
+        let dal = gen_ax_arr(&mut rng, navars, nevars, 2);
+        let dar = gen_ax_arr(&mut rng, navars, nevars, 2);
         let assertions = vec![
             ArrAssertion::ElemsEqual(el.clone(), er.clone()),
             ArrAssertion::ArraysEqual(al.clone(), ar.clone()),
+            ArrAssertion::ElemsDistinct(dl.clone(), dr.clone()),
+            ArrAssertion::ArraysDistinct(dal.clone(), dar.clone()),
         ];
 
         let mut smt2 = String::from("(set-logic QF_ALIA)\n");
@@ -763,6 +791,22 @@ fn ax_z3_serialization_roundtrips_through_own_parser() {
         }
         for a in &assertions {
             match a {
+                ArrAssertion::ElemsDistinct(l, r) => {
+                    smt2.push_str(&format!(
+                        "(assert (distinct {} {}))
+",
+                        ax_elem_to_smt2(l),
+                        ax_elem_to_smt2(r)
+                    ));
+                }
+                ArrAssertion::ArraysDistinct(l, r) => {
+                    smt2.push_str(&format!(
+                        "(assert (distinct {} {}))
+",
+                        ax_arr_to_smt2(l),
+                        ax_arr_to_smt2(r)
+                    ));
+                }
                 ArrAssertion::ElemsEqual(l, r) => {
                     smt2.push_str(&format!(
                         "(assert (= {} {}))\n",
@@ -800,8 +844,48 @@ fn ax_z3_serialization_roundtrips_through_own_parser() {
         // The engine may honestly return Unknown on hard random instances;
         // any decided answer must be kernel-Accepted.
         if direct != SolveResult::Unknown {
-            assert!(dv.is_accept());
+            assert!(
+                dv.is_accept(),
+                "case {case}: direct {direct:?} verdict {dv:?}"
+            );
             assert!(rv.is_accept(), "round-tripped model was not accepted");
         }
     }
+}
+
+/// Offline soundness guard for QF_AX with disequalities. No external oracle is
+/// needed: every decided engine answer must be accepted by the trusted kernel,
+/// which is the guarantee the certificate architecture exists to give.
+#[test]
+fn ax_decided_answers_are_always_kernel_accepted() {
+    let mut rng = Lcg(0x5eed_d15e);
+    let mut decided = 0u32;
+    for case in 0..400u32 {
+        let navars = 1 + rng.below(2);
+        let nevars = 1 + rng.below(3);
+        let mut assertions = Vec::new();
+        for _ in 0..(1 + rng.below(4)) {
+            let kind = rng.below(4);
+            let elem = |rng: &mut Lcg| gen_ax_elem(rng, navars, nevars, 2);
+            let arr = |rng: &mut Lcg| gen_ax_arr(rng, navars, nevars, 2);
+            assertions.push(match kind {
+                0 => ArrAssertion::ElemsEqual(elem(&mut rng), elem(&mut rng)),
+                1 => ArrAssertion::ArraysEqual(arr(&mut rng), arr(&mut rng)),
+                2 => ArrAssertion::ElemsDistinct(elem(&mut rng), elem(&mut rng)),
+                _ => ArrAssertion::ArraysDistinct(arr(&mut rng), arr(&mut rng)),
+            });
+        }
+        let (claim, verdict) = solve_and_check_arrays(navars, nevars, &assertions, 200_000);
+        if claim != SolveResult::Unknown {
+            decided += 1;
+            assert!(
+                verdict.is_accept(),
+                "case {case}: claim {claim:?} not accepted: {verdict:?}\n{assertions:?}"
+            );
+        }
+    }
+    assert!(
+        decided > 100,
+        "generator should decide most cases, got {decided}"
+    );
 }

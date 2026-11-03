@@ -1501,22 +1501,66 @@ fn collect_ax_assertions(
             if args.len() != 2 {
                 return Err(SmtError::BadArity("equality expects 2 arguments".into()));
             }
-            match (ax_side(&args[0], ctx)?, ax_side(&args[1], ctx)?) {
-                (AxSide::Elem(l), AxSide::Elem(r)) => {
-                    out.push(ArrAssertion::ElemsEqual(l, r));
-                    Ok(())
-                }
-                (AxSide::Array(l), AxSide::Array(r)) => {
-                    out.push(ArrAssertion::ArraysEqual(l, r));
-                    Ok(())
-                }
-                _ => Err(SmtError::Unsupported(
-                    "equality between an array and an element".into(),
-                )),
+            collect_ax_pair(&args[0], &args[1], ctx, out, false)
+        }
+        Term::App(Op::Distinct, args) => {
+            if args.len() < 2 {
+                return Err(SmtError::BadArity(
+                    "distinct expects 2 or more arguments".into(),
+                ));
             }
+            // `distinct` of n terms means every pair is different.
+            for i in 0..args.len() {
+                for j in (i + 1)..args.len() {
+                    collect_ax_pair(&args[i], &args[j], ctx, out, true)?;
+                }
+            }
+            Ok(())
+        }
+        Term::App(Op::Not, args) if args.len() == 1 => match &args[0] {
+            Term::App(Op::Eq, eq) if eq.len() == 2 => {
+                collect_ax_pair(&eq[0], &eq[1], ctx, out, true)
+            }
+            Term::App(Op::Distinct, ne) if ne.len() == 2 => {
+                collect_ax_pair(&ne[0], &ne[1], ctx, out, false)
+            }
+            _ => Err(SmtError::Unsupported(
+                "QF_AX lowering supports only negated equalities".into(),
+            )),
+        },
+        _ => Err(SmtError::Unsupported(
+            "QF_AX lowering supports only conjunctions of equalities and disequalities".into(),
+        )),
+    }
+}
+
+/// Lower `l = r` (or `l != r` when `distinct`) for two terms of the same sort.
+fn collect_ax_pair(
+    l: &Term,
+    r: &Term,
+    ctx: &mut AxParserCtx,
+    out: &mut Vec<ArrAssertion>,
+    distinct: bool,
+) -> Result<(), SmtError> {
+    match (ax_side(l, ctx)?, ax_side(r, ctx)?) {
+        (AxSide::Elem(l), AxSide::Elem(r)) => {
+            out.push(if distinct {
+                ArrAssertion::ElemsDistinct(l, r)
+            } else {
+                ArrAssertion::ElemsEqual(l, r)
+            });
+            Ok(())
+        }
+        (AxSide::Array(l), AxSide::Array(r)) => {
+            out.push(if distinct {
+                ArrAssertion::ArraysDistinct(l, r)
+            } else {
+                ArrAssertion::ArraysEqual(l, r)
+            });
+            Ok(())
         }
         _ => Err(SmtError::Unsupported(
-            "QF_AX lowering supports only conjunctions of equalities".into(),
+            "equality or disequality between an array and an element".into(),
         )),
     }
 }
@@ -1834,5 +1878,80 @@ mod tests {
                 other => panic!("{:?}: expected Parse error, got {:?}", src, other),
             }
         }
+    }
+
+    #[test]
+    fn ax_script_unsat_array_disequality() {
+        let src = "
+(set-logic QF_AX)
+(declare-fun a () (Array Int Int))
+(declare-fun b () (Array Int Int))
+(assert (= a b))
+(assert (not (= a b)))
+(check-sat)
+";
+        let script = parse_script(src).unwrap();
+        let prob = script.to_array().unwrap();
+        assert!(matches!(
+            prob.assertions[1],
+            ArrAssertion::ArraysDistinct(..)
+        ));
+        let (claim, verdict) = crate::reference::solve_and_check_arrays(
+            prob.avars.len() as u32,
+            prob.evars.len() as u32,
+            &prob.assertions,
+            100_000,
+        );
+        assert_eq!(claim, tpt_solver_core::engine::SolveResult::Unsat);
+        assert!(verdict.is_accept());
+    }
+
+    #[test]
+    fn ax_distinct_of_three_terms_expands_to_every_pair() {
+        let src = "
+(set-logic QF_AX)
+(declare-fun x () Int)
+(declare-fun y () Int)
+(declare-fun z () Int)
+(assert (distinct x y z))
+(check-sat)
+";
+        let prob = parse_script(src).unwrap().to_array().unwrap();
+        assert_eq!(prob.assertions.len(), 3);
+        assert!(prob
+            .assertions
+            .iter()
+            .all(|a| matches!(a, ArrAssertion::ElemsDistinct(..))));
+    }
+
+    #[test]
+    fn ax_satisfiable_disequality_is_accepted() {
+        let src = "
+(set-logic QF_AX)
+(declare-fun a () (Array Int Int))
+(declare-fun i () Int)
+(assert (distinct a (store a i 5)))
+(check-sat)
+";
+        let prob = parse_script(src).unwrap().to_array().unwrap();
+        let (claim, verdict) = crate::reference::solve_and_check_arrays(
+            prob.avars.len() as u32,
+            prob.evars.len() as u32,
+            &prob.assertions,
+            100_000,
+        );
+        assert_eq!(claim, tpt_solver_core::engine::SolveResult::Sat);
+        assert!(verdict.is_accept());
+    }
+
+    #[test]
+    fn ax_negated_non_equality_is_unsupported() {
+        let src = "
+(set-logic QF_AX)
+(declare-fun x () Int)
+(assert (not (> x 1)))
+";
+        let script = parse_script(src).unwrap();
+        assert!(matches!(script.to_array(), Err(SmtError::Unsupported(_))));
     }
 }

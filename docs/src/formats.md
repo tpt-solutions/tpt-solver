@@ -15,7 +15,7 @@ order: linear arithmetic, then bit-vectors, then arrays, then propositional.
 |--------|-----------|
 | QF_LRA | Linear real arithmetic. `+ - *`, where `*` and `/` take a constant operand. Integers are treated as reals. Strict `<` and `>` are treated as non-strict, which is a known limitation. |
 | QF_BV | Fixed-width vectors of up to 64 bits. Bitwise and arithmetic operators, constant shifts, `concat`, and `extract`. |
-| QF_AX | Positive ground equalities over arrays. Disequalities are not yet supported. |
+| QF_AX | Ground equalities and disequalities over arrays and elements. Arrays range over an unbounded index universe, so two arrays are distinct when they differ at some index. The answer is decided when the congruence closure or the model settles the question, and is `unknown` otherwise. |
 | QF_SAT | Propositional connectives, lowered to CNF by Tseitin encoding. |
 
 Commands are handled as follows. `set-logic`, `set-option`, `declare-fun`,
