@@ -348,8 +348,11 @@ Plan: `C:\Users\Phillip\.claude\plans\review-project-fix-any-vivid-quokka.md`.
       rather than clause-provenance hints. The core is irreducible but not guaranteed
       minimal. Recording antecedents in `sat.rs::analyze` is still open for a cheaper
       core and for LRAT hints.
-- [ ] Array disequalities / extensionality (core + check). Open: needs a design for
-      certifying `a != b` (a witness index, checked by the kernel). Not started.
+- [x] Array disequalities / extensionality (core + check). Done: an UNSAT names the
+      asserted disequality whose sides merged, which the kernel checks against the
+      input. SAT models give each array class a default and each element class a
+      fresh value, and the self-check decides whether a disequality holds. Incomplete by
+      design: cases the closure and the model cannot settle return `unknown`.
 - [x] Document in `--help` that MPS is feasibility-only (objective dropped).
 
 ### 7c — CLI and library ergonomics
@@ -358,15 +361,16 @@ Plan: `C:\Users\Phillip\.claude\plans\review-project-fix-any-vivid-quokka.md`.
 - [x] Content-based format detection, `--format`, stdin (`-`), `.gz` input.
 - [x] `--output {human,json,competition}` with competition `s`/`v` lines and exit
       codes 10/20/0; `--model`, `--timeout`, `-v/-q`, `--stats`.
-- [~] Parse errors carry a line number for DIMACS and MPS. Column numbers and
-      positions in SMT-LIB2 are still open.
+- [~] Parse errors carry a line number for DIMACS, MPS and SMT-LIB2 (the line of the
+      failing command; structural errors report line 0). Column numbers are still open.
 - [x] Subcommands: `check <problem> <proof>`, `bench` (CSV), `completions <shell>`,
       `man` (clap_mangen).
 - [x] Library: `prelude`, `solve_str`/`solve_file` returning `Result<Report, Error>`
       with a unified `Error`; `#![warn(missing_docs)]`; examples.
-- [ ] Optional `serde` feature for the library. Not started.
-- [~] Proof format documented exactly in `docs/src/proof-format.md`. The
-      `drat-trim` cross-check is still open: the tool is not installed here.
+- [x] Optional `serde` feature for the library: `Report`, `Stats`, `Proof`, `Model` and `Theory` serialize, with the same field names as `--output json`.
+- [~] Proof format documented exactly in `docs/src/proof-format.md`. The `drat-trim`
+      cross-check is still open. The source was reachable, but compiling it was denied
+      by the permission classifier in this session, so it has not been run.
 
 ### 7d — Packaging and CI
 - [x] `version = "0.1.0"` on path deps; homepage, documentation and include lists; each
@@ -374,13 +378,15 @@ Plan: `C:\Users\Phillip\.claude\plans\review-project-fix-any-vivid-quokka.md`.
       The dependent crates can only be dry-run after core is published.
 - [x] cargo-dist release (six targets, shell and PowerShell installers, sha256
       checksums) generated into `.github/workflows/release.yml`; README badges.
-- [ ] GHCR `Dockerfile`. Not written: Docker is not available in this environment, so
-      it could not be built or tested.
+- [~] GHCR `Dockerfile` written (multi-stage, Rust 1.85 build). Not built or tested:
+      Docker is not available here. No publish workflow was added.
 - [x] CI: Linux/Windows/macOS test matrix, blocking `cargo-deny`, `cargo doc -D
       warnings`, `no_std` build of core/check for `wasm32-unknown-unknown`, rust-cache,
       Dependabot.
-- [ ] Kani on `tpt-solver-check`. Open: the checker has no harnesses yet, and Kani is
-      not installed here to run them.
+- [~] Kani harnesses on `tpt-solver-check` written (model acceptance, refutation of a
+      satisfiable formula, zero Farkas multiplier), and the CI Kani job runs them. Kani
+      supports only Linux and macOS, so they have not been run here. The same claims
+      are checked exhaustively by `tests/kernel_guarantees.rs` on every platform.
 - [x] `CONTRIBUTING.md`, `SECURITY.md`, root `CHANGELOG.md`, issue and PR templates;
       `spec.txt` and `todo.md` moved to `docs/internal/`.
 
@@ -392,8 +398,9 @@ Plan: `C:\Users\Phillip\.claude\plans\review-project-fix-any-vivid-quokka.md`.
       and `check`. 10 pytest tests pass locally. A tagged PyPI publish job is in
       `python.yml`. It needs PyPI trusted publishing configured.
 - [~] Benchmark harness: criterion benches, `bench/` corpus runner, nightly job and
-      llvm-cov job. Comparison against minisat is open. The runner records Z3 only
-      when `z3` is on PATH, and neither was available here.
+      llvm-cov job. `run.py --oracle CMD` compares against any SAT-competition solver,
+      and was tested with a stub oracle that agreed on all 12 instances. No real
+      minisat was run, because none is installed here.
 - [x] Docs site (mdBook): trust model, formats, proof formats, fuel versus timeout,
       library use and FAQ; deployed by the Pages workflow.
 - [ ] Still open from Phase 6: SAT-COMP / SMT-COMP benchmark run (needs the official
