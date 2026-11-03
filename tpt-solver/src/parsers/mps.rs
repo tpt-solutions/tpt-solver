@@ -424,16 +424,20 @@ fn parse_number(s: &str) -> Result<Rational, MpsError> {
         )
         .ok_or_else(bad)?;
     let mut r = Rational::new(num, frac_scale).ok_or_else(bad)?;
-    if exp > 0 {
-        let scale = pow10(exp as u32).ok_or_else(bad)?;
-        r = r
-            .mul(Rational::new(scale, 1).ok_or_else(bad)?)
-            .ok_or_else(bad)?;
-    } else if exp < 0 {
-        let scale = pow10((-exp) as u32).ok_or_else(bad)?;
-        r = r
-            .checked_div(Rational::new(scale, 1).ok_or_else(bad)?)
-            .ok_or_else(bad)?;
+    match exp.cmp(&0) {
+        std::cmp::Ordering::Greater => {
+            let scale = pow10(exp as u32).ok_or_else(bad)?;
+            r = r
+                .mul(Rational::new(scale, 1).ok_or_else(bad)?)
+                .ok_or_else(bad)?;
+        }
+        std::cmp::Ordering::Less => {
+            let scale = pow10((-exp) as u32).ok_or_else(bad)?;
+            r = r
+                .checked_div(Rational::new(scale, 1).ok_or_else(bad)?)
+                .ok_or_else(bad)?;
+        }
+        std::cmp::Ordering::Equal => {}
     }
     Ok(r)
 }

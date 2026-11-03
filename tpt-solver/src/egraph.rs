@@ -445,8 +445,8 @@ fn parse_pat_tokens(toks: &[String], i: usize) -> (Pat, usize) {
         (make_op(&op, args), j + 1)
     } else {
         let atom = &toks[i];
-        let pat = if atom.starts_with('?') {
-            Pat::Var(atom[1..].to_string())
+        let pat = if let Some(name) = atom.strip_prefix('?') {
+            Pat::Var(name.to_string())
         } else if atom == "true" {
             Pat::True
         } else if atom == "false" {
@@ -570,10 +570,10 @@ fn add_term(eg: &mut EGraph, term: &Term) -> Result<Id, SmtError> {
             Ok(eg.add(BoolLang::Not(a)))
         }
         Term::App(Op::And, args) => {
-            fold_binary(eg, args, BoolLang::True, |a, b| BoolLang::And(a, b))
+            fold_binary(eg, args, BoolLang::True, BoolLang::And)
         }
         Term::App(Op::Or, args) => {
-            fold_binary(eg, args, BoolLang::False, |a, b| BoolLang::Or(a, b))
+            fold_binary(eg, args, BoolLang::False, BoolLang::Or)
         }
         Term::App(Op::Imp, args) => {
             if args.len() != 2 {
@@ -695,10 +695,10 @@ fn extract(eg: &EGraph) -> HashMap<Id, BoolLang> {
     // Defensive: ensure every representative has *some* enode (only reachable if a
     // class consisted solely of cyclic enodes, which these rules cannot produce).
     for cid in eg.reps() {
-        if !best.contains_key(&cid) {
+        if let std::collections::hash_map::Entry::Vacant(e) = best.entry(cid) {
             if let Some(ns) = eg.nodes.get(&cid) {
                 if let Some(n) = ns.first() {
-                    best.insert(cid, n.clone());
+                    e.insert(n.clone());
                 }
             }
         }
