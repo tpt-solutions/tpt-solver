@@ -33,6 +33,9 @@ pub struct SatAnswer {
     pub proof: Vec<Vec<i32>>,
 }
 
+/// `heap_pos` sentinel for a variable that is not currently in the decision heap.
+const NOT_IN_HEAP: usize = usize::MAX;
+
 #[derive(Clone, Copy, Debug)]
 struct Watcher {
     clause: usize,
@@ -67,6 +70,11 @@ pub struct CdclSolver {
     propagate_head: usize,
     unassigned: u32,
     activity: Vec<f64>,
+    /// Binary max-heap of candidate decision variables, ordered by [`Self::heap_before`].
+    /// Every unassigned variable is in the heap; assigned ones may linger until popped.
+    heap: Vec<usize>,
+    /// `heap_pos[v]` is `v`'s index in `heap`, or [`NOT_IN_HEAP`].
+    heap_pos: Vec<usize>,
     polarity: Vec<bool>,
     conflicts: u32,
     restart_limit: u32,
@@ -105,6 +113,8 @@ impl CdclSolver {
             propagate_head: 0,
             unassigned: n_vars,
             activity: vec![0.0; n],
+            heap: (0..n).collect(),
+            heap_pos: (0..n).collect(),
             polarity: (0..n_vars).map(|v| seeded_polarity(seed, v)).collect(),
             conflicts: 0,
             restart_limit: core::cmp::max(100, n_vars),
@@ -382,6 +392,7 @@ impl CdclSolver {
                 self.level[v] = 0;
                 self.reason[v] = None;
                 self.unassigned += 1;
+                self.heap_insert(v);
             }
             self.trail_lim.pop();
         }
@@ -398,32 +409,112 @@ impl CdclSolver {
 
     fn bump_var_activity(&mut self, v: usize) {
         self.activity[v] += 1.0;
+        if self.heap_pos[v] != NOT_IN_HEAP {
+            self.heap_sift_up(self.heap_pos[v]);
+        }
         if self.activity[v] > 1e100 {
             let mut i = 0;
             while i < self.activity.len() {
                 self.activity[i] *= 1e-100;
                 i += 1;
             }
+            self.heap_rebuild();
+        }
+    }
+
+    /// Whether variable `a` should be decided before `b`: higher activity first,
+    /// then lower index. That is exactly the choice a linear argmax scan makes.
+    #[inline]
+    fn heap_before(&self, a: usize, b: usize) -> bool {
+        let (act_a, act_b) = (self.activity[a], self.activity[b]);
+        act_a > act_b || (act_a == act_b && a < b)
+    }
+
+    fn heap_sift_up(&mut self, mut i: usize) {
+        let v = self.heap[i];
+        while i > 0 {
+            let parent = (i - 1) / 2;
+            let p = self.heap[parent];
+            if !self.heap_before(v, p) {
+                break;
+            }
+            self.heap[i] = p;
+            self.heap_pos[p] = i;
+            i = parent;
+        }
+        self.heap[i] = v;
+        self.heap_pos[v] = i;
+    }
+
+    fn heap_sift_down(&mut self, mut i: usize) {
+        let v = self.heap[i];
+        let len = self.heap.len();
+        loop {
+            let left = 2 * i + 1;
+            if left >= len {
+                break;
+            }
+            let right = left + 1;
+            let child = if right < len && self.heap_before(self.heap[right], self.heap[left]) {
+                right
+            } else {
+                left
+            };
+            let c = self.heap[child];
+            if !self.heap_before(c, v) {
+                break;
+            }
+            self.heap[i] = c;
+            self.heap_pos[c] = i;
+            i = child;
+        }
+        self.heap[i] = v;
+        self.heap_pos[v] = i;
+    }
+
+    fn heap_insert(&mut self, v: usize) {
+        if self.heap_pos[v] != NOT_IN_HEAP {
+            return;
+        }
+        self.heap.push(v);
+        self.heap_sift_up(self.heap.len() - 1);
+    }
+
+    fn heap_pop(&mut self) -> Option<usize> {
+        let top = *self.heap.first()?;
+        let last = self.heap.pop()?;
+        self.heap_pos[top] = NOT_IN_HEAP;
+        if !self.heap.is_empty() {
+            self.heap[0] = last;
+            self.heap_sift_down(0);
+        }
+        Some(top)
+    }
+
+    /// Restore the heap property after activities changed in bulk.
+    fn heap_rebuild(&mut self) {
+        let mut i = self.heap.len() / 2;
+        while i > 0 {
+            i -= 1;
+            self.heap_sift_down(i);
+        }
+        for (i, &v) in self.heap.iter().enumerate() {
+            self.heap_pos[v] = i;
         }
     }
 
     fn decide(&mut self) {
-        // Pick the unassigned variable with the highest activity.
-        let mut best: i32 = -1;
-        let mut best_act = -1.0f64;
-        let mut v = 0;
-        while v < self.n_vars as usize {
-            if self.assigns[v].is_none() && self.activity[v] > best_act {
-                best_act = self.activity[v];
-                best = v as i32;
+        // Pop until an unassigned variable with the highest activity surfaces.
+        // Assigned variables popped here are re-inserted by `cancel_until`.
+        let v = loop {
+            match self.heap_pop() {
+                Some(v) if self.assigns[v].is_none() => break v,
+                Some(_) => continue,
+                None => return, // none unassigned (caller checks unassigned==0 first)
             }
-            v += 1;
-        }
-        if best < 0 {
-            return; // none unassigned (caller checks unassigned==0 first)
-        }
-        let var = (best as usize) + 1;
-        let lit = if self.polarity[best as usize] {
+        };
+        let var = v + 1;
+        let lit = if self.polarity[v] {
             var as i32
         } else {
             -(var as i32)
@@ -582,6 +673,7 @@ impl CdclSolver {
             self.activity[i] *= 0.95;
             i += 1;
         }
+        self.heap_rebuild();
         self.reduce_db()
     }
 
@@ -834,6 +926,28 @@ mod tests {
                     panic!("engine gave Unknown on tiny formula (bug): {:?}", cls);
                 }
             }
+        }
+    }
+
+    proptest::proptest! {
+        /// Popping the heap yields variables in the same order as a linear argmax
+        /// scan (highest activity first, lowest index on ties), which is what the
+        /// heap replaced in `decide`.
+        #[test]
+        fn heap_pop_order_matches_linear_argmax(acts in proptest::collection::vec(0u8..4, 1..40)) {
+            let n = acts.len() as u32;
+            let mut s = CdclSolver::new(n, Fuel::new(1), 0, Cancel::none());
+            for (v, a) in acts.iter().enumerate() {
+                s.activity[v] = f64::from(*a);
+            }
+            s.heap_rebuild();
+            let mut expected: Vec<usize> = (0..acts.len()).collect();
+            expected.sort_by(|&a, &b| acts[b].cmp(&acts[a]).then(a.cmp(&b)));
+            let mut got = Vec::new();
+            while let Some(v) = s.heap_pop() {
+                got.push(v);
+            }
+            proptest::prop_assert_eq!(got, expected);
         }
     }
 }
