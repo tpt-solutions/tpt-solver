@@ -38,6 +38,7 @@
 //! * [`Script::to_cnf`] Tseitin-encodes a *propositional* formula into a DIMACS-style
 //!   [`Problem`] for the CDCL engine (non-arithmetic QF_SAT).
 
+use crate::parsers::Located;
 use crate::reference::Problem;
 use std::collections::HashMap;
 use std::error::Error;
@@ -95,9 +96,21 @@ enum Tok {
     Atom(String),
 }
 
-fn tokenize(input: &str) -> Result<Vec<Tok>, SmtError> {
+/// Split `input` into tokens. Each token comes with the 1-based line it starts on,
+/// so that a failing command can be reported by line.
+fn tokenize(input: &str) -> Result<(Vec<Tok>, Vec<usize>), Located<SmtError>> {
     let bytes: Vec<char> = input.chars().collect();
+    // The line of every character, so a token knows where it starts.
+    let mut line_at = Vec::with_capacity(bytes.len());
+    let mut line = 1usize;
+    for &c in &bytes {
+        line_at.push(line);
+        if c == '\n' {
+            line += 1;
+        }
+    }
     let mut toks = Vec::new();
+    let mut lines = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
@@ -114,11 +127,13 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, SmtError> {
         }
         if c == '(' {
             toks.push(Tok::LParen);
+            lines.push(line_at[i]);
             i += 1;
             continue;
         }
         if c == ')' {
             toks.push(Tok::RParen);
+            lines.push(line_at[i]);
             i += 1;
             continue;
         }
@@ -132,11 +147,15 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, SmtError> {
             i += 1;
         }
         if i == start {
-            return Err(SmtError::Parse(format!("unexpected character '{}'", c)));
+            return Err(Located {
+                line: line_at[i],
+                error: SmtError::Parse(format!("unexpected character '{}'", c)),
+            });
         }
         toks.push(Tok::Atom(bytes[start..i].iter().collect()));
+        lines.push(line_at[start]);
     }
-    Ok(toks)
+    Ok((toks, lines))
 }
 
 // ---------------------------------------------------------------------------
@@ -1172,59 +1191,102 @@ impl Encoder {
 // ---------------------------------------------------------------------------
 
 /// Parse an SMT-LIB2 script string into a [`Script`].
-pub fn parse_script(input: &str) -> Result<Script, SmtError> {
-    let toks = tokenize(input)?;
+/// Parse a script, reporting the line of the command that failed.
+///
+/// Structural errors, such as unbalanced parentheses, belong to no single command
+/// and report line `0`.
+pub fn parse_script_located(input: &str) -> Result<Script, Located<SmtError>> {
+    let (toks, lines) = tokenize(input)?;
     let mut pos = 0;
-    let sexps = parse_sexps(&toks, &mut pos, 0)?;
+    let sexps = parse_sexps(&toks, &mut pos, 0).map_err(whole_document)?;
     if pos != toks.len() {
-        return Err(SmtError::Parse("unexpected ')'".into()));
+        return Err(whole_document(SmtError::Parse("unexpected ')'".into())));
     }
 
+    let starts = top_level_starts(&toks);
     let mut script = Script::default();
-    for sexp in &sexps {
-        match sexp {
-            Sexp::List(items) => {
-                if items.is_empty() {
-                    continue;
-                }
-                if let Sexp::Atom(head) = &items[0] {
-                    match head.as_str() {
-                        "set-logic" => {
-                            if let Some(Sexp::Atom(l)) = items.get(1) {
-                                script.logic = Some(l.clone());
-                            }
-                        }
-                        "set-option" => {}
-                        "declare-fun" | "declare-const" => match parse_decl(head, items) {
-                            Some(decl) => {
-                                if script.decls.len() >= MAX_DECLARATIONS {
-                                    return Err(SmtError::Unsupported(format!(
-                                        "more than {MAX_DECLARATIONS} declared symbols"
-                                    )));
-                                }
-                                script.decls.push(decl);
-                            }
-                            None => {
-                                return Err(SmtError::Parse(format!("malformed {}", head)));
-                            }
-                        },
-                        "define-fun" | "define-sort" | "declare-sort" | "push" | "pop"
-                        | "reset" | "reset-assertions" | "check-sat-assuming" | "get-value" => {
-                            return Err(SmtError::Unsupported(format!("command `{}`", head)));
-                        }
-                        "assert" => match items.get(1) {
-                            Some(body) => script.asserts.push(sexp_to_term(body)?),
-                            None => return Err(SmtError::Parse("assert without a formula".into())),
-                        },
-                        "check-sat" | "get-model" | "exit" => {}
-                        _ => {}
-                    }
-                }
-            }
-            Sexp::Atom(_) => {}
-        }
+    for (k, sexp) in sexps.iter().enumerate() {
+        apply_command(&mut script, sexp).map_err(|error| Located {
+            line: starts
+                .get(k)
+                .and_then(|&t| lines.get(t))
+                .copied()
+                .unwrap_or(0),
+            error,
+        })?;
     }
     Ok(script)
+}
+
+/// Parse a script. [`parse_script_located`] also reports where an error was found.
+pub fn parse_script(input: &str) -> Result<Script, SmtError> {
+    parse_script_located(input).map_err(|e| e.error)
+}
+
+fn whole_document(error: SmtError) -> Located<SmtError> {
+    Located { line: 0, error }
+}
+
+/// The token index at which each top-level item of `toks` starts, in order.
+fn top_level_starts(toks: &[Tok]) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut depth = 0usize;
+    for (i, tok) in toks.iter().enumerate() {
+        match tok {
+            Tok::LParen => {
+                if depth == 0 {
+                    starts.push(i);
+                }
+                depth += 1;
+            }
+            Tok::RParen => depth = depth.saturating_sub(1),
+            Tok::Atom(_) => {
+                if depth == 0 {
+                    starts.push(i);
+                }
+            }
+        }
+    }
+    starts
+}
+
+/// Apply one top-level command to `script`. Commands with no effect on the problem
+/// (`set-option`, `check-sat`, `get-model`, `exit`) are accepted and ignored.
+fn apply_command(script: &mut Script, sexp: &Sexp) -> Result<(), SmtError> {
+    let Sexp::List(items) = sexp else {
+        return Ok(());
+    };
+    let Some(Sexp::Atom(head)) = items.first() else {
+        return Ok(());
+    };
+    match head.as_str() {
+        "set-logic" => {
+            if let Some(Sexp::Atom(l)) = items.get(1) {
+                script.logic = Some(l.clone());
+            }
+        }
+        "declare-fun" | "declare-const" => match parse_decl(head, items) {
+            Some(decl) => {
+                if script.decls.len() >= MAX_DECLARATIONS {
+                    return Err(SmtError::Unsupported(format!(
+                        "more than {MAX_DECLARATIONS} declared symbols"
+                    )));
+                }
+                script.decls.push(decl);
+            }
+            None => return Err(SmtError::Parse(format!("malformed {}", head))),
+        },
+        "define-fun" | "define-sort" | "declare-sort" | "push" | "pop" | "reset"
+        | "reset-assertions" | "check-sat-assuming" | "get-value" => {
+            return Err(SmtError::Unsupported(format!("command `{}`", head)));
+        }
+        "assert" => match items.get(1) {
+            Some(body) => script.asserts.push(sexp_to_term(body)?),
+            None => return Err(SmtError::Parse("assert without a formula".into())),
+        },
+        _ => {}
+    }
+    Ok(())
 }
 
 fn parse_decl(head: &str, items: &[Sexp]) -> Option<Decl> {
@@ -1953,5 +2015,22 @@ mod tests {
 ";
         let script = parse_script(src).unwrap();
         assert!(matches!(script.to_array(), Err(SmtError::Unsupported(_))));
+    }
+
+    #[test]
+    fn errors_report_the_line_of_the_failing_command() {
+        let unsupported = "(set-logic QF_LRA)\n(declare-fun x () Real)\n(push 1)\n";
+        let e = parse_script_located(unsupported).unwrap_err();
+        assert_eq!(e.line, 3);
+        assert!(matches!(e.error, SmtError::Unsupported(_)));
+
+        let bodiless = "(set-logic QF_LRA)\n\n; comment\n(assert)\n";
+        let e = parse_script_located(bodiless).unwrap_err();
+        assert_eq!(e.line, 4);
+        assert!(matches!(e.error, SmtError::Parse(_)));
+
+        let unbalanced = "(set-logic QF_LRA)\n(assert (> 1 0)\n";
+        let e = parse_script_located(unbalanced).unwrap_err();
+        assert_eq!(e.line, 0, "structural errors belong to the whole document");
     }
 }

@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use crate::parsers::dimacs::parse_dimacs_located;
 use crate::parsers::mps::parse_mps_located;
-use crate::parsers::smtlib2::{parse_script, SmtError};
+use crate::parsers::smtlib2::{parse_script_located, SmtError};
 use crate::parsers::Located;
 use crate::policy::solve_cnf_certified;
 use crate::reference::{
@@ -434,7 +434,7 @@ fn parse_error(format: Format, e: Located<crate::parsers::mps::MpsError>) -> Err
 }
 
 fn solve_smtlib2(input: &str, opts: &Options, start: Clock) -> Result<Report, Error> {
-    let script = parse_script(input).map_err(smt_error)?;
+    let script = parse_script_located(input).map_err(smt_located)?;
 
     // Prefer linear arithmetic, then bit-vectors, then arrays, then propositional.
     match script.to_lra() {
@@ -522,6 +522,14 @@ fn smt_error(e: SmtError) -> Error {
         format: Format::SmtLib2,
         line: 0,
         message: e.to_string(),
+    }
+}
+
+fn smt_located(e: Located<SmtError>) -> Error {
+    Error::Parse {
+        format: Format::SmtLib2,
+        line: e.line,
+        message: e.error.to_string(),
     }
 }
 
@@ -709,7 +717,7 @@ pub fn check_proof_text(problem: &str, format: Format, proof: &str) -> Result<Ou
             check_farkas_text(&lra.constraints, proof)
         }
         Format::SmtLib2 => {
-            let script = parse_script(problem).map_err(smt_error)?;
+            let script = parse_script_located(problem).map_err(smt_located)?;
             let lra = script.to_lra().map_err(|e| {
                 Error::Unsupported(format!("proof checking needs a QF_LRA problem: {}", e))
             })?;
