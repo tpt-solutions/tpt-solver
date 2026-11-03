@@ -32,4 +32,7 @@ pub mod bv;
 pub mod lra;
 pub mod lrat;
 pub mod outcome;
+
+#[cfg(kani)]
+pub mod kani_harnesses;
 pub mod sat;

@@ -1,0 +1,6 @@
+target/
+.git/
+bench/results.csv
+docs/book/
+tpt-solver-wasm/web/pkg/
+tpt-solver-py/target/

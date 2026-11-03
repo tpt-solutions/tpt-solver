@@ -38,3 +38,6 @@ tpt-solver-core = { path = "../tpt-solver-core", version = "0.1.0" }
 [features]
 default = ["std"]
 std = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

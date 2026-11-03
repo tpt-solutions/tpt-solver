@@ -108,6 +108,11 @@ jobs:
         # `cargo kani` provides the `kani` crate and sets `cfg(kani)`; no Cargo
         # dependency or feature flag is required.
         run: cargo kani -p tpt-solver-core
+      - name: Run Kani harnesses (checker kernel)
+        # The kernel's guarantees: an accepted model satisfies its clause, a
+        # satisfiable formula is never refuted, and a zero Farkas multiplier certifies
+        # nothing.
+        run: cargo kani -p tpt-solver-check
 
   loom:
     name: Loom (portfolio cancellation flag)

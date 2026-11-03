@@ -21,10 +21,17 @@ performance across commits.
 
 ## Competitor comparison
 
-If `z3` is on PATH, `run.py` records its verdict in the `z3` column, so answers can
-be compared against an external oracle. Comparison against minisat or Kissat needs
-those binaries installed, and the runner does not invoke them yet. The corpus is
-small, so timings should be read as regression signals, not as competition results.
+`run.py --oracle CMD` runs an external SAT-competition solver on every instance and
+fails the run if its verdict disagrees with a certified answer. Quote paths that contain
+spaces, because the command is split like a shell command line. For example:
+
+```sh
+python bench/run.py --oracle "minisat"
+```
+
+minisat is not vendored or installed by this repository. `z3` on PATH fills the `z3`
+column in the same way. Neither oracle was run in this environment, so comparison
+results are not yet recorded.
 
 ## Corpus
 
