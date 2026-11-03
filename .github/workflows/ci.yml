@@ -127,7 +127,10 @@ jobs:
         # `cargo +nightly fuzz run <target>` outside CI.
         # `-timeout=10` caps a single hanging input; libFuzzer's default is 1200s,
         # and `-max_total_time` alone doesn't stop a run stuck on one input.
+        # `--target` is pinned to gnu: cargo-fuzz otherwise defaults to the musl
+        # target on Linux, which has no installed std and rejects the sanitizer
+        # because musl links libc statically.
         run: |
           for target in dimacs mps smtlib2; do
-            cargo +nightly fuzz run "$target" -- -max_total_time=60 -timeout=10
+            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=60 -timeout=10
           done
