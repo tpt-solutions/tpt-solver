@@ -1,0 +1,54 @@
+name: Pages
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build the book and the playground
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install mdBook and wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook,wasm-pack
+      - name: Build the user guide
+        run: mdbook build docs
+      - name: Build the WebAssembly playground
+        run: wasm-pack build tpt-solver-wasm --target web --out-dir web/pkg --release
+      - name: Assemble the site
+        run: |
+          mkdir -p site/playground
+          cp -r docs/book/. site/
+          cp -r tpt-solver-wasm/web/. site/playground/
+          rm -rf site/playground/LICENSE-* site/playground/*.md
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

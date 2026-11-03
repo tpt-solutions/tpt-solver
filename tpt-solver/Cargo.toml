@@ -32,6 +32,9 @@ categories = [
     "parsing",
 ]
 
+# Config for 'dist'
+[package.metadata.dist]
+
 [lib]
 name = "tpt_solver"
 path = "src/lib.rs"
@@ -52,8 +55,13 @@ clap_mangen = "0.2"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
+criterion = { version = "0.5", default-features = false }
 # Truth-table equivalence checking of the e-graph simplification pass.
 proptest = "1"
+
+[[bench]]
+name = "solve"
+harness = false
 
 [features]
 default = ["std"]

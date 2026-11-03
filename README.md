@@ -1,5 +1,9 @@
 # tpt-solver
 
+[![CI](https://github.com/tpt-solutions/tpt-solver/actions/workflows/ci.yml/badge.svg)](https://github.com/tpt-solutions/tpt-solver/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+[![Playground](https://img.shields.io/badge/playground-WebAssembly-0f766e.svg)](https://tpt-solutions.github.io/tpt-solver/playground/)
+
 A high-performance constraint, SAT, and SMT solver suite in pure Rust, built on a
 **certificate architecture**: an untrusted, aggressively-optimized search engine
 paired with a small, independently-verified checker kernel that revalidates every
