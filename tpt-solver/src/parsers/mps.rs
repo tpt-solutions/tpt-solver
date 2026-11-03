@@ -29,6 +29,7 @@
 
 use crate::parsers::dimacs::MAX_VARIABLES;
 use crate::parsers::smtlib2::LraProblem;
+use crate::parsers::Located;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -134,6 +135,12 @@ enum Section {
 
 /// Parse a free-format MPS document into an [`LraProblem`].
 pub fn parse_mps(input: &str) -> Result<LraProblem, MpsError> {
+    parse_mps_located(input).map_err(|e| e.error)
+}
+
+/// Like [`parse_mps`], but the error records the 1-based line it was found on
+/// (`line == 0` for errors about the whole document, such as a missing `ROWS`).
+pub fn parse_mps_located(input: &str) -> Result<LraProblem, Located<MpsError>> {
     let mut section = Section::None;
 
     let mut row_order: Vec<String> = Vec::new();
@@ -149,11 +156,11 @@ pub fn parse_mps(input: &str) -> Result<LraProblem, MpsError> {
     let mut col_order: Vec<String> = Vec::new();
     let mut bounds: HashMap<usize, Bound> = HashMap::new();
 
-    for raw_line in input.lines() {
+    let mut process = |raw_line: &str| -> Result<(), MpsError> {
         let line = raw_line.split('$').next().unwrap_or("").trim_end();
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('*') {
-            continue;
+            return Ok(());
         }
         let toks: Vec<&str> = trimmed.split_whitespace().collect();
 
@@ -165,7 +172,7 @@ pub fn parse_mps(input: &str) -> Result<LraProblem, MpsError> {
         if is_header_line {
             if let Some(next) = section_header(toks[0]) {
                 section = next;
-                continue;
+                return Ok(());
             }
         }
 
@@ -202,7 +209,7 @@ pub fn parse_mps(input: &str) -> Result<LraProblem, MpsError> {
                     // INTORG/INTEND delimit an integer column range; the columns
                     // themselves are still parsed normally as continuous reals
                     // (no integer/bitvector theory yet — see spec Phase 5).
-                    continue;
+                    return Ok(());
                 }
                 if toks.len() < 3 || toks.len() % 2 == 0 {
                     return Err(MpsError::OddPairCount(trimmed.to_string()));
@@ -290,10 +297,20 @@ pub fn parse_mps(input: &str) -> Result<LraProblem, MpsError> {
                 }
             }
         }
+        Ok(())
+    };
+    for (idx, raw_line) in input.lines().enumerate() {
+        process(raw_line).map_err(|error| Located {
+            line: idx + 1,
+            error,
+        })?;
     }
 
     if row_order.is_empty() {
-        return Err(MpsError::NoRows);
+        return Err(Located {
+            line: 0,
+            error: MpsError::NoRows,
+        });
     }
 
     let n = col_order.len();
@@ -301,12 +318,16 @@ pub fn parse_mps(input: &str) -> Result<LraProblem, MpsError> {
 
     for (i, kind) in constraint_rows.iter().enumerate() {
         let rhs = rhs_val[i];
-        let (lo, hi) = row_bounds(*kind, rhs, range_val[i])?;
+        let (lo, hi) =
+            row_bounds(*kind, rhs, range_val[i]).map_err(|error| Located { line: 0, error })?;
         let mut coeffs = vec![Rational::zero(); n];
         for &(col, val) in &sparse[i] {
-            coeffs[col] = coeffs[col].add(val).ok_or_else(|| {
-                MpsError::BadNumber("coefficient accumulation overflowed".to_string())
-            })?;
+            coeffs[col] = coeffs[col]
+                .add(val)
+                .ok_or_else(|| {
+                    MpsError::BadNumber("coefficient accumulation overflowed".to_string())
+                })
+                .map_err(|error| Located { line: 0, error })?;
         }
         if let Some(u) = hi {
             constraints.push(LinConstraint {

@@ -524,6 +524,7 @@ struct Decl {
 /// A parsed SMT-LIB2 script: the logic, declared symbols, and asserted formulas.
 #[derive(Debug, Clone, Default)]
 pub struct Script {
+    /// The value of `(set-logic ...)`, if the script names one.
     pub logic: Option<String>,
     decls: Vec<Decl>,
     asserts: Vec<Term>,

@@ -7,3 +7,25 @@
 pub mod dimacs;
 pub mod mps;
 pub mod smtlib2;
+
+/// A parse error tagged with the 1-based line it was found on. `line == 0` means
+/// the error concerns the document as a whole rather than one line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Located<E> {
+    /// 1-based line number, or `0` for document-level errors.
+    pub line: usize,
+    /// The underlying parse error.
+    pub error: E,
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for Located<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.line == 0 {
+            write!(f, "{}", self.error)
+        } else {
+            write!(f, "line {}: {}", self.line, self.error)
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for Located<E> {}

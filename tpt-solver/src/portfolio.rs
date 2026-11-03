@@ -21,7 +21,8 @@
 use std::sync::{mpsc, Arc};
 use std::thread;
 
-use crate::reference::{check_cdcl_answer, Problem};
+use crate::reference::{certify_cdcl_answer, Certified, Problem};
+use tpt_solver_check::lrat::LratProof;
 use tpt_solver_check::outcome::Outcome;
 use tpt_solver_core::cancel::Cancel;
 use tpt_solver_core::engine::SolveResult;
@@ -38,6 +39,30 @@ pub fn solve_and_check_cdcl_portfolio(
     fuel_per_worker: u64,
     workers: usize,
 ) -> (SolveResult, Outcome) {
+    let (claim, verdict, _proof) =
+        solve_and_check_cdcl_portfolio_with_proof(problem, fuel_per_worker, workers);
+    (claim, verdict)
+}
+
+/// Like [`solve_and_check_cdcl_portfolio`], but also returns the checked
+/// [`LratProof`] of the accepted winner on an UNSAT claim (`None` otherwise), so
+/// `--emit-proof --parallel` can export the certificate that was verified.
+pub fn solve_and_check_cdcl_portfolio_with_proof(
+    problem: &Problem,
+    fuel_per_worker: u64,
+    workers: usize,
+) -> (SolveResult, Outcome, Option<LratProof>) {
+    let c = solve_and_check_cdcl_portfolio_certified(problem, fuel_per_worker, workers);
+    (c.claim, c.verdict, c.proof)
+}
+
+/// Like [`solve_and_check_cdcl_portfolio_with_proof`], but returns the winner's
+/// model too, so a SAT answer can be displayed without re-solving.
+pub fn solve_and_check_cdcl_portfolio_certified(
+    problem: &Problem,
+    fuel_per_worker: u64,
+    workers: usize,
+) -> Certified {
     let workers = workers.max(1);
     let clauses = Arc::new(problem.clauses.clone());
     let var_count = problem.var_count;
@@ -60,24 +85,29 @@ pub fn solve_and_check_cdcl_portfolio(
     // below terminate instead of blocking forever.
     drop(tx);
 
-    let mut fallback: Option<(SolveResult, Outcome)> = None;
+    let mut fallback: Option<Certified> = None;
     for ans in rx {
-        let verdict = check_cdcl_answer(problem, ans);
-        if verdict.1.is_accept() {
+        let cert = certify_cdcl_answer(problem, ans);
+        if cert.verdict.is_accept() {
             cancel.request();
             for h in handles {
                 let _ = h.join();
             }
-            return verdict;
+            return cert;
         }
         if fallback.is_none() {
-            fallback = Some(verdict);
+            fallback = Some(cert);
         }
     }
     for h in handles {
         let _ = h.join();
     }
-    fallback.unwrap_or((SolveResult::Unknown, Outcome::Inconclusive))
+    fallback.unwrap_or(Certified {
+        claim: SolveResult::Unknown,
+        verdict: Outcome::Inconclusive,
+        model: None,
+        proof: None,
+    })
 }
 
 #[cfg(test)]

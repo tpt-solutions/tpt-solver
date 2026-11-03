@@ -15,6 +15,7 @@
 //! literal exceeds it, since some generators are sloppy. It never panics on bad
 //! input — it returns [`DimacsError`].
 
+use crate::parsers::Located;
 use crate::reference::Problem;
 use std::error::Error;
 use std::fmt;
@@ -80,20 +81,27 @@ impl From<std::num::ParseIntError> for DimacsError {
 }
 
 /// Parse a DIMACS CNF document into a [`Problem`].
+/// Errors carry no line number; use [`parse_dimacs_located`] for that.
 pub fn parse_dimacs(input: &str) -> Result<Problem, DimacsError> {
+    parse_dimacs_located(input).map_err(|e| e.error)
+}
+
+/// Like [`parse_dimacs`], but the error records the 1-based line it was found on
+/// (`line == 0` for errors about the whole document, such as a missing header).
+pub fn parse_dimacs_located(input: &str) -> Result<Problem, Located<DimacsError>> {
     let mut var_count: u32 = 0;
     let mut header_seen = false;
     let mut clauses: Vec<Vec<i32>> = Vec::new();
     let mut current: Vec<i32> = Vec::new();
     let mut max_var: u32 = 0;
 
-    for line in input.lines() {
+    let mut process = |line: &str| -> Result<(), DimacsError> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            continue;
+            return Ok(());
         }
         if trimmed.starts_with('c') {
-            continue;
+            return Ok(());
         }
         if trimmed.starts_with('p') {
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
@@ -107,7 +115,7 @@ pub fn parse_dimacs(input: &str) -> Result<Problem, DimacsError> {
             // The clause count in the header is informational; we derive the true
             // count from the terminators actually present.
             header_seen = true;
-            continue;
+            return Ok(());
         }
 
         for tok in trimmed.split_whitespace() {
@@ -138,18 +146,31 @@ pub fn parse_dimacs(input: &str) -> Result<Problem, DimacsError> {
                 current.push(lit);
             }
         }
+        Ok(())
+    };
+    for (idx, line) in input.lines().enumerate() {
+        process(line).map_err(|error| Located {
+            line: idx + 1,
+            error,
+        })?;
     }
 
     if !current.is_empty() {
         // Some files omit the final `0`; treat the trailing run as a clause.
         if clauses.len() >= MAX_CLAUSES {
-            return Err(DimacsError::TooManyClauses);
+            return Err(Located {
+                line: 0,
+                error: DimacsError::TooManyClauses,
+            });
         }
         clauses.push(current);
     }
 
     if !header_seen && max_var == 0 {
-        return Err(DimacsError::MissingHeader);
+        return Err(Located {
+            line: 0,
+            error: DimacsError::MissingHeader,
+        });
     }
     if !header_seen {
         var_count = max_var;

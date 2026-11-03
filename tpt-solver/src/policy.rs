@@ -13,10 +13,11 @@
 //! * **Rates are tracked** (`VerdictTracker`) — accept/reject/inconclusive as a triad,
 //!   so "safe but unproductive" regressions are visible, not just soundness bugs.
 
-use crate::portfolio::solve_and_check_cdcl_portfolio;
-use crate::reference::{solve_and_check, solve_and_check_cdcl, Problem};
+use crate::portfolio::solve_and_check_cdcl_portfolio_certified;
+use crate::reference::{certify_cdcl_answer, solve, solve_and_check, Certified, Problem};
 use tpt_solver_check::outcome::Outcome;
 use tpt_solver_core::engine::SolveResult;
+use tpt_solver_core::sat::solve_cnf;
 
 /// The fallback tier reached after a checker rejection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,7 +36,9 @@ pub enum FallbackTier {
 /// A mandatory post-mortem record produced whenever the checker does not `Accept`.
 #[derive(Clone, Debug)]
 pub struct RejectionDump {
+    /// Number of variables in the rejected problem.
     pub var_count: u32,
+    /// Number of clauses in the rejected problem.
     pub clause_count: usize,
     /// Whether the (rejected) engine produced a certificate at all.
     pub certificate_present: bool,
@@ -71,10 +74,12 @@ pub struct VerdictTracker {
 }
 
 impl VerdictTracker {
+    /// An empty tracker with all counts at zero.
     pub fn new() -> VerdictTracker {
         VerdictTracker::default()
     }
 
+    /// Count one checker verdict.
     pub fn record(&mut self, outcome: Outcome) {
         if outcome.is_accept() {
             self.accept += 1;
@@ -85,12 +90,15 @@ impl VerdictTracker {
         }
     }
 
+    /// Number of answers the kernel accepted.
     pub fn accept(&self) -> u64 {
         self.accept
     }
+    /// Number of answers the kernel rejected.
     pub fn reject(&self) -> u64 {
         self.reject
     }
+    /// Number of answers the kernel could not decide.
     pub fn inconclusive(&self) -> u64 {
         self.inconclusive
     }
@@ -121,86 +129,108 @@ impl VerdictTracker {
     }
 }
 
-/// Solve a problem through the full certified pipeline with tiered fallback.
+/// Solve a CNF problem through the full certified pipeline with tiered fallback.
 ///
-/// 1. Tier 0 — optimized CDCL, certified by the kernel.
-/// 2. On non-`Accept`, fall back to the simpler, more-exhaustively-tested reference
-///    DPLL solver (Tier 3) and recertify.
-/// 3. If still not `Accept`, return the (untrusted) last answer with
+/// Tier 0 is one sequential CDCL run when `workers <= 1`, and a race of `workers`
+/// diverse CDCL workers otherwise. The answer is kept only if the kernel `Accept`s
+/// it. Otherwise:
+///
+/// 1. Fall back to the simpler, more-exhaustively-tested reference DPLL solver
+///    (Tier 3) and recertify.
+/// 2. If still not `Accept`, return the (untrusted) last answer with
 ///    [`FallbackTier::Unknown`] and a [`RejectionDump`] for post-mortem.
 ///
-/// Only an `Accept` verdict may be trusted by the caller.
+/// Only an `Accept` verdict may be trusted by the caller. The returned
+/// [`Certified`] carries the model or proof the checker looked at.
+pub fn solve_cnf_certified(
+    problem: &Problem,
+    fuel: u64,
+    workers: usize,
+) -> (Certified, Option<RejectionDump>) {
+    let parallel = workers > 1;
+    let cert = if parallel {
+        solve_and_check_cdcl_portfolio_certified(problem, fuel, workers)
+    } else {
+        certify_cdcl_answer(
+            problem,
+            solve_cnf(problem.var_count, &problem.clauses, fuel),
+        )
+    };
+    if cert.verdict.is_accept() {
+        return (cert, None);
+    }
+    let first_engine: &'static str = match (parallel, cert.claim) {
+        (false, SolveResult::Sat) => "cdcl(sat)",
+        (false, SolveResult::Unsat) => "cdcl(unsat)",
+        (false, SolveResult::Unknown) => "cdcl(unknown)",
+        (true, SolveResult::Sat) => "cdcl-portfolio(sat)",
+        (true, SolveResult::Unsat) => "cdcl-portfolio(unsat)",
+        (true, SolveResult::Unknown) => "cdcl-portfolio(unknown)",
+    };
+    fallback_after_cdcl_reject(
+        problem,
+        fuel,
+        first_engine,
+        cert.claim != SolveResult::Unknown,
+    )
+}
+
+/// Sequential-CDCL form of [`solve_cnf_certified`], returning just the verdict.
 pub fn solve_certified(
     problem: &Problem,
     fuel: u64,
 ) -> (SolveResult, Outcome, Option<RejectionDump>) {
-    let (claim, verdict) = solve_and_check_cdcl(problem, fuel);
-    if verdict.is_accept() {
-        return (claim, verdict, None);
-    }
-    let first_engine: &'static str = match claim {
-        SolveResult::Sat => "cdcl(sat)",
-        SolveResult::Unsat => "cdcl(unsat)",
-        SolveResult::Unknown => "cdcl(unknown)",
-    };
-    fallback_after_cdcl_reject(problem, fuel, first_engine, claim != SolveResult::Unknown)
+    let (cert, dump) = solve_cnf_certified(problem, fuel, 1);
+    (cert.claim, cert.verdict, dump)
 }
 
-/// Like [`solve_certified`], but Tier 0 races `workers` diverse CDCL workers
-/// against the problem instead of running one sequentially
-/// ([`solve_and_check_cdcl_portfolio`]) — the same fail-closed guarantee,
-/// usually faster on the happy path. Falls through to the exact same
-/// reference-DPLL / `Unknown`+dump tiers on a non-`Accept` race.
+/// Portfolio form of [`solve_cnf_certified`] (`workers` racing CDCL workers),
+/// returning just the verdict.
 pub fn solve_certified_portfolio(
     problem: &Problem,
     fuel_per_worker: u64,
     workers: usize,
 ) -> (SolveResult, Outcome, Option<RejectionDump>) {
-    let (claim, verdict) = solve_and_check_cdcl_portfolio(problem, fuel_per_worker, workers);
-    if verdict.is_accept() {
-        return (claim, verdict, None);
-    }
-    let first_engine: &'static str = match claim {
-        SolveResult::Sat => "cdcl-portfolio(sat)",
-        SolveResult::Unsat => "cdcl-portfolio(unsat)",
-        SolveResult::Unknown => "cdcl-portfolio(unknown)",
-    };
-    fallback_after_cdcl_reject(
-        problem,
-        fuel_per_worker,
-        first_engine,
-        claim != SolveResult::Unknown,
-    )
+    let (cert, dump) = solve_cnf_certified(problem, fuel_per_worker, workers);
+    (cert.claim, cert.verdict, dump)
 }
 
 /// Shared Tier 1 (reference DPLL, recertified) / Tier 2 (`Unknown` + dump)
-/// fallback, reused after either a sequential or portfolio CDCL reject.
+/// fallback, reused after either a sequential or portfolio CDCL reject. The DPLL
+/// path emits no proof, so its UNSAT answers can only ever be `Inconclusive`.
 fn fallback_after_cdcl_reject(
     problem: &Problem,
     fuel: u64,
     first_engine: &'static str,
     cert_present: bool,
-) -> (SolveResult, Outcome, Option<RejectionDump>) {
-    let (claim2, verdict2) = solve_and_check(problem, fuel);
-    if verdict2.is_accept() {
-        let dump = RejectionDump {
-            var_count: problem.var_count,
-            clause_count: problem.clauses.len(),
-            certificate_present: cert_present,
-            engine_path: first_engine,
-            tier_reached: FallbackTier::SimplerSolver,
-        };
-        return (claim2, verdict2, Some(dump));
-    }
-
+) -> (Certified, Option<RejectionDump>) {
+    let (claim, verdict) = solve_and_check(problem, fuel);
+    let model = if claim == SolveResult::Sat {
+        solve(problem, fuel).model
+    } else {
+        None
+    };
+    let tier_reached = if verdict.is_accept() {
+        FallbackTier::SimplerSolver
+    } else {
+        FallbackTier::Unknown
+    };
     let dump = RejectionDump {
         var_count: problem.var_count,
         clause_count: problem.clauses.len(),
         certificate_present: cert_present,
         engine_path: first_engine,
-        tier_reached: FallbackTier::Unknown,
+        tier_reached,
     };
-    (claim2, verdict2, Some(dump))
+    (
+        Certified {
+            claim,
+            verdict,
+            model,
+            proof: None,
+        },
+        Some(dump),
+    )
 }
 
 #[cfg(test)]

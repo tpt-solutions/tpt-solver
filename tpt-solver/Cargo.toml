@@ -35,6 +35,10 @@ tpt-solver-check = { path = "../tpt-solver-check" }
 # Boolean-formula preprocessing uses a small, dependency-free in-house e-graph
 # (see `src/egraph.rs`) instead of the external `egg` crate (spec §4.3, §7).
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+clap_mangen = "0.2"
+# Gzip-compressed inputs (pure-Rust backend, so the build stays portable).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 # Truth-table equivalence checking of the e-graph simplification pass.

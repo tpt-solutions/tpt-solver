@@ -27,7 +27,9 @@ use tpt_solver_core::sat::SatAnswer;
 /// breaks it panics there rather than being silently weakened.
 #[derive(Clone, Debug)]
 pub struct Problem {
+    /// Number of variables; literals range over `1..=var_count`.
     pub var_count: u32,
+    /// The clauses, each a list of signed literals. Clause order is preserved.
     pub clauses: Vec<Vec<i32>>,
 }
 
@@ -58,6 +60,7 @@ impl Problem {
 /// The result of the reference solver.
 #[derive(Clone, Debug)]
 pub struct RefResult {
+    /// The claim: `Sat`, `Unsat`, or `Unknown` when fuel ran out.
     pub outcome: tpt_solver_core::engine::SolveResult,
     /// The model (var `i` -> `true`/`false`), present only on `Sat`.
     pub model: Option<Vec<bool>>,
@@ -269,6 +272,32 @@ pub fn solve_and_check_cdcl(problem: &Problem, fuel: u64) -> (SolveResult, Outco
     check_cdcl_answer(problem, ans)
 }
 
+/// A solver answer after the trusted checker has looked at it, together with the
+/// witness it checked: the model on SAT, the LRAT proof on UNSAT.
+#[derive(Clone, Debug)]
+pub struct Certified {
+    /// The engine's claim.
+    pub claim: SolveResult,
+    /// The checker's three-way verdict on `claim` and its witness.
+    pub verdict: Outcome,
+    /// Model (variable `i + 1` is index `i`), present on a SAT claim that had one.
+    pub model: Option<Vec<bool>>,
+    /// The proof the checker validated, present on an UNSAT claim.
+    pub proof: Option<LratProof>,
+}
+
+/// Check a raw CDCL [`SatAnswer`] and keep its model and proof alongside the verdict.
+pub fn certify_cdcl_answer(problem: &Problem, ans: SatAnswer) -> Certified {
+    let model = ans.model.clone();
+    let (claim, verdict, proof) = check_cdcl_answer_with_proof(problem, ans);
+    Certified {
+        claim,
+        verdict,
+        model,
+        proof,
+    }
+}
+
 /// Like [`check_cdcl_answer`], but also hands back the checked [`LratProof`] on an
 /// UNSAT claim (`None` for SAT/Unknown) — used by `--emit-proof` so the exact
 /// certificate the kernel just validated can be dumped for external re-verification.
@@ -367,16 +396,68 @@ pub fn solve_and_check_bv(
     assertions: &[tpt_solver_core::bv::BvAssertion],
     fuel: u64,
 ) -> (SolveResult, Outcome) {
+    let (claim, verdict, _proof) = solve_and_check_bv_with_proof(var_count, assertions, fuel);
+    (claim, verdict)
+}
+
+/// Like [`solve_and_check_bv`], but also returns the CDCL proof clauses (DRAT-style,
+/// one `0`-terminated clause per entry, ending in the empty clause) for the
+/// bit-blasted CNF on an UNSAT claim. The blasted CNF itself is not included, so
+/// the proof is checkable against the bit-blast, not the original `.smt2`.
+pub fn solve_and_check_bv_with_proof(
+    var_count: u32,
+    assertions: &[tpt_solver_core::bv::BvAssertion],
+    fuel: u64,
+) -> (SolveResult, Outcome, Option<Vec<Vec<i32>>>) {
+    let c = solve_and_check_bv_certified(var_count, assertions, fuel);
+    (c.claim, c.verdict, c.proof)
+}
+
+/// A checked QF_BV answer: the word-level model on SAT (one value per variable id),
+/// the CDCL proof clauses on UNSAT (see [`solve_and_check_bv_with_proof`]).
+#[derive(Clone, Debug)]
+pub struct BvCertified {
+    /// The engine's claim.
+    pub claim: SolveResult,
+    /// The kernel's verdict on `claim` and its witness.
+    pub verdict: Outcome,
+    /// Word value per variable id, present on a SAT claim.
+    pub model: Option<Vec<u64>>,
+    /// DRAT-style proof clauses for the bit-blast, present on an UNSAT claim.
+    pub proof: Option<Vec<Vec<i32>>>,
+}
+
+/// Like [`solve_and_check_bv`], returning the model or proof with the verdict.
+pub fn solve_and_check_bv_certified(
+    var_count: u32,
+    assertions: &[tpt_solver_core::bv::BvAssertion],
+    fuel: u64,
+) -> BvCertified {
     match tpt_solver_core::bv::solve_bv(var_count, assertions, fuel) {
         Some(tpt_solver_core::bv::BvOutcome::Sat(model)) => {
             let verdict = tpt_solver_check::bv::check_bv_model(assertions, &model, var_count);
-            (SolveResult::Sat, verdict)
+            BvCertified {
+                claim: SolveResult::Sat,
+                verdict,
+                model: Some(model.values),
+                proof: None,
+            }
         }
         Some(tpt_solver_core::bv::BvOutcome::Unsat(cert)) => {
             let verdict = tpt_solver_check::bv::check_bv_unsat(&cert);
-            (SolveResult::Unsat, verdict)
+            BvCertified {
+                claim: SolveResult::Unsat,
+                verdict,
+                model: None,
+                proof: Some(cert.proof),
+            }
         }
-        None => (SolveResult::Unknown, Outcome::Inconclusive),
+        None => BvCertified {
+            claim: SolveResult::Unknown,
+            verdict: Outcome::Inconclusive,
+            model: None,
+            proof: None,
+        },
     }
 }
 

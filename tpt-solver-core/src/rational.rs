@@ -9,6 +9,7 @@
 //! panic, keeping the `#![deny(clippy::panic)]` guarantee.
 
 use core::cmp::Ordering;
+use core::fmt;
 
 /// An exact rational `num / den` with `den > 0` (canonical form).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +137,37 @@ impl Rational {
     }
 }
 
+impl Rational {
+    /// The numerator of the canonical form (carries the sign).
+    pub fn num(self) -> i128 {
+        self.num
+    }
+
+    /// The denominator of the canonical form (always positive).
+    pub fn den(self) -> i128 {
+        self.den
+    }
+
+    /// Parse `n` or `n/d` in the same form [`Display`](fmt::Display) prints.
+    /// Returns `None` on malformed text, a zero denominator, or overflow.
+    pub fn parse(text: &str) -> Option<Rational> {
+        match text.split_once('/') {
+            None => Rational::new(text.parse().ok()?, 1),
+            Some((n, d)) => Rational::new(n.parse().ok()?, d.parse().ok()?),
+        }
+    }
+}
+
+impl fmt::Display for Rational {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.den == 1 {
+            write!(f, "{}", self.num)
+        } else {
+            write!(f, "{}/{}", self.num, self.den)
+        }
+    }
+}
+
 impl PartialOrd for Rational {
     fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
         Some(self.cmp(o))
@@ -161,6 +193,21 @@ fn gcd(mut a: u128, mut b: u128) -> u128 {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_parse_round_trip() {
+        for r in [
+            Rational::new(3, 1).unwrap(),
+            Rational::new(-7, 3).unwrap(),
+            Rational::new(1, 2).unwrap(),
+            Rational::zero(),
+        ] {
+            assert_eq!(Rational::parse(&r.to_string()), Some(r));
+        }
+        assert_eq!(Rational::parse("4/0"), None);
+        assert_eq!(Rational::parse("x/2"), None);
+        assert_eq!(Rational::parse("6/4"), Rational::new(3, 2));
+    }
 
     #[test]
     fn arithmetic() {
