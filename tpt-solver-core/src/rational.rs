@@ -5,7 +5,7 @@
 //! needs is exact rational addition, multiplication, and sign comparison — the
 //! bounded linear-arithmetic surface that the verifier (and `tpt-telos`) is meant to
 //! cover. It is `i128`-backed; any operation that would overflow returns `None` so
-//! callers can degrade to [`Outcome::Inconclusive`](crate::outcome) rather than
+//! callers can degrade to `Outcome::Inconclusive` rather than
 //! panic, keeping the `#![deny(clippy::panic)]` guarantee.
 
 use core::cmp::Ordering;

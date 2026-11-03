@@ -6,6 +6,17 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/tpt-solver-check"
+include = [
+    "Cargo.toml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE-*",
+    "src/**/*",
+    "tests/**/*",
+    "examples/**/*",
+]
 description = "The small, independently-checkable trusted kernel for the tpt-solver suite (LRAT/Farkas/model recheck)"
 readme = "README.md"
 keywords = [
@@ -22,7 +33,7 @@ categories = [
 ]
 
 [dependencies]
-tpt-solver-core = { path = "../tpt-solver-core" }
+tpt-solver-core = { path = "../tpt-solver-core", version = "0.1.0" }
 
 [features]
 default = ["std"]

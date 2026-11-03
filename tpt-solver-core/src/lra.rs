@@ -3,7 +3,7 @@
 //! The prover eliminates variables one at a time; every derived constraint is a
 //! *nonnegative* combination of the originals, so when elimination reaches a
 //! contradiction (`0 <= negative`) the accumulated multiplier vector is a valid
-//! **Farkas certificate** — exactly what [`tpt_solver_check::lra::check_farkas`]
+//! **Farkas certificate** — exactly what `tpt_solver_check::lra::check_farkas`
 //! re-validates. This is the LRA counterpart of the SAT RUP proof: the kernel never
 //! trusts the engine, it re-derives.
 
@@ -127,7 +127,7 @@ pub fn fourier_motzkin(input: &[LinConstraint]) -> Option<FmResult> {
 ///
 /// The prover's job here is narrow: *given* that Fourier–Motzkin already decided the
 /// system is feasible, find one concrete satisfying assignment. That assignment is
-/// never trusted — [`tpt_solver_check::lra::check_lra_model`] re-substitutes it into
+/// never trusted — `tpt_solver_check::lra::check_lra_model` re-substitutes it into
 /// the original constraints and rejects any that don't actually hold. So an imperfect
 /// Simplex only ever degrades a SAT answer to `Inconclusive`, never to a wrong
 /// `Accept`.
@@ -363,7 +363,7 @@ impl Tableau {
 ///
 /// Returns:
 /// * `Some(Some(model))` — a model (one value per original variable) that the caller
-///   should revalidate with [`tpt_solver_check::lra::check_lra_model`].
+///   should revalidate with `tpt_solver_check::lra::check_lra_model`.
 /// * `Some(None)` — the system is infeasible (no model exists).
 /// * `None` — exact arithmetic overflowed or iteration budget was exhausted; treated
 ///   as "could not decide", never as a sound answer.

@@ -66,10 +66,10 @@ impl Model {
 
 /// Verify that `model` satisfies `cnf`.
 ///
-/// Returns [`Outcome::Accept`] if every clause contains at least one literal made
-/// true by the model, [`Outcome::Reject`] otherwise (the engine returned a model that
+/// Returns `Outcome::Accept` if every clause contains at least one literal made
+/// true by the model, `Outcome::Reject` otherwise (the engine returned a model that
 /// does not actually satisfy the formula). A malformed input with a literal whose
-/// variable exceeds the declared range is reported as [`Outcome::Inconclusive`].
+/// variable exceeds the declared range is reported as `Outcome::Inconclusive`.
 #[inline]
 pub fn check_model(cnf: &Cnf, model: &Model, var_count: u32) -> crate::outcome::Outcome {
     use crate::outcome::Outcome;

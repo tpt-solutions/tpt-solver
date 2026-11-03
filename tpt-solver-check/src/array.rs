@@ -4,7 +4,7 @@
 //!   assertions and re-evaluate them here, with this file's own evaluator.
 //!   Models shorter than the declared variable counts are `Inconclusive`,
 //!   never silently zero-padded.
-//! * **UNSAT** — replay the certificate ([`AxCertificate`]): each fact is an
+//! * **UNSAT** — replay the certificate (`AxCertificate`): each fact is an
 //!   axiom instance whose *local* term shape is checked syntactically and
 //!   whose precondition is decided by this file's own union-find at
 //!   application time. Facts are applied in stratified passes until none can

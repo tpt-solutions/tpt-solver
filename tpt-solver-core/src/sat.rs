@@ -4,11 +4,11 @@
 //! branching, restarts, and learnt-clause deletion. Every answer is recheckable:
 //!
 //! * **SAT** — a model is produced; the periphery re-substitutes it into the original
-//!   CNF via [`tpt_solver_check`].
+//!   CNF via `tpt_solver_check`.
 //! * **UNSAT** — a sequence of learned clauses is emitted as an LRAT-style proof
 //!   (each step is RUP-derivable from the original clauses plus earlier steps; the
 //!   final step is the empty clause). The periphery validates the whole chain with
-//!   [`tpt_solver_check::lrat`].
+//!   `tpt_solver_check::lrat`.
 //!
 //! The engine is *not* trusted: if it ever emits an unsound clause, the checker
 //! rejects it. The engine itself never panics and always respects its [`Fuel`].
@@ -739,7 +739,7 @@ impl CdclSolver {
 /// Solve a CNF with `n_vars` variables (1-based) and the given clauses.
 ///
 /// Returns the engine's claim plus a model (on `Sat`) or an LRAT-style proof (on
-/// `Unsat`). The result is untrusted until rechecked by [`tpt_solver_check`].
+/// `Unsat`). The result is untrusted until rechecked by `tpt_solver_check`.
 pub fn solve_cnf(n_vars: u32, clauses: &[Vec<i32>], fuel: u64) -> SatAnswer {
     solve_cnf_worker(n_vars, clauses, fuel, 0, Cancel::none())
 }

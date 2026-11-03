@@ -6,6 +6,17 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/tpt-solver"
+include = [
+    "Cargo.toml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE-*",
+    "src/**/*",
+    "tests/**/*",
+    "examples/**/*",
+]
 description = "Periphery for the tpt-solver suite: parsers, CLI, e-graph preprocessing, and integration glue"
 readme = "README.md"
 keywords = [
@@ -30,8 +41,8 @@ name = "tpt-solver"
 path = "src/main.rs"
 
 [dependencies]
-tpt-solver-core = { path = "../tpt-solver-core" }
-tpt-solver-check = { path = "../tpt-solver-check" }
+tpt-solver-core = { path = "../tpt-solver-core", version = "0.1.0" }
+tpt-solver-check = { path = "../tpt-solver-check", version = "0.1.0" }
 # Boolean-formula preprocessing uses a small, dependency-free in-house e-graph
 # (see `src/egraph.rs`) instead of the external `egg` crate (spec §4.3, §7).
 clap = { version = "4", features = ["derive"] }

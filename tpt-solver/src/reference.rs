@@ -67,7 +67,7 @@ pub struct RefResult {
 }
 
 /// Solve `problem` with a bounded DPLL search. Returns [`RefResult`] with
-/// [`SolveResult::Unknown`](tpt_solver_core::engine::SolveResult::Unknown) if the
+/// `SolveResult::Unknown` if the
 /// step budget (fuel) is exhausted before a decision.
 pub fn solve(problem: &Problem, fuel: u64) -> RefResult {
     let n = problem.var_count as usize;
@@ -342,7 +342,7 @@ pub fn solve_and_check_cdcl_with_proof(
 /// * **UNSAT** — the prover emits a Farkas certificate, re-checked coefficient-by-
 ///   coefficient by [`check_farkas`].
 /// * **SAT** — Simplex extracts a satisfying assignment, which the kernel re-substitutes
-///   into the original constraints via [`check_lra_model`]. If Simplex fails to produce
+///   into the original constraints via `tpt_solver_check::lra::check_lra_model`. If Simplex fails to produce
 ///   a model the verdict degrades to `Inconclusive` rather than a wrong `Accept`.
 pub fn solve_and_check_lra(constraints: &[LinConstraint], _fuel: u64) -> (SolveResult, Outcome) {
     match fourier_motzkin(constraints) {

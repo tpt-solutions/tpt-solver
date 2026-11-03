@@ -15,7 +15,7 @@
 //!   unwrap on a fallible path; everything returns `Result`/`Option` or consumes
 //!   *fuel* and returns [`Unknown`](crate::engine::SolveResult::Unknown).
 //! * A built-in **fuel** system: every loop consumes fuel and returns
-//!   [`SolveResult::Unknown`] on depletion rather than looping forever or panicking.
+//!   `SolveResult::Unknown` on depletion rather than looping forever or panicking.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(clippy::unwrap_used)]

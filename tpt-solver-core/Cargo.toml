@@ -6,6 +6,17 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/tpt-solver-core"
+include = [
+    "Cargo.toml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE-*",
+    "src/**/*",
+    "tests/**/*",
+    "examples/**/*",
+]
 description = "Untrusted but high-performance solving engine (CDCL, DPLL(T), Simplex) for the tpt-solver suite"
 readme = "README.md"
 keywords = [
