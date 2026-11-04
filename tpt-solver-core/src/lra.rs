@@ -45,17 +45,29 @@ struct Internal {
     mult: Vec<Rational>,
 }
 
-/// Run Fourier–Motzkin elimination.
+/// Run Fourier–Motzkin elimination with no budget.
+///
+/// Elimination can grow the constraint set doubly exponentially, so untrusted input
+/// should go through [`fourier_motzkin_with_fuel`] instead.
+pub fn fourier_motzkin(input: &[LinConstraint]) -> Option<FmResult> {
+    fourier_motzkin_with_fuel(input, u64::MAX)
+}
+
+/// Run Fourier–Motzkin elimination, spending one unit of `fuel` per derived
+/// constraint.
 ///
 /// Returns [`FmResult::Unsat`] with a Farkas certificate when a contradiction is
 /// found, otherwise [`FmResult::Sat`]. Returns `None` if exact arithmetic overflows
-/// (caller should treat as "could not decide", never as a sound answer).
+/// or `fuel` is exhausted (caller should treat as "could not decide", never as a
+/// sound answer).
 #[allow(clippy::needless_range_loop)]
-pub fn fourier_motzkin(input: &[LinConstraint]) -> Option<FmResult> {
+pub fn fourier_motzkin_with_fuel(input: &[LinConstraint], fuel: u64) -> Option<FmResult> {
+    let mut fuel = fuel;
     if input.is_empty() {
         return Some(FmResult::Sat);
     }
     let n = input[0].coeffs.len();
+    let row_cost = (n + input.len()) as u64;
     let mut cons: Vec<Internal> = input
         .iter()
         .enumerate()
@@ -88,6 +100,12 @@ pub fn fourier_motzkin(input: &[LinConstraint]) -> Option<FmResult> {
                     continue;
                 }
                 // m1 = -coeff(lj) > 0, m2 = coeff(ui) > 0.
+                // Each derived row costs one unit per coefficient and per multiplier,
+                // so fuel bounds memory as well as time on wide systems.
+                if fuel < row_cost {
+                    return None;
+                }
+                fuel -= row_cost;
                 let m1 = lj.coeffs[k].neg();
                 let m2 = ui.coeffs[k];
                 let mut nc = vec![Rational::zero(); n];
@@ -412,6 +430,16 @@ mod tests {
         // x <= 5, x >= 0
         let cons = vec![c(&[1], 5), c(&[-1], 0)];
         assert_eq!(fourier_motzkin(&cons), Some(FmResult::Sat));
+    }
+
+    #[test]
+    fn fuel_exhaustion_is_undecided() {
+        // x <= 5, x >= 0: eliminating x derives one row costing n + m = 1 + 2 units,
+        // so less fuel means "could not decide" (never a verdict), and exactly that
+        // much is enough.
+        let cons = vec![c(&[1], 5), c(&[-1], 0)];
+        assert_eq!(fourier_motzkin_with_fuel(&cons, 2), None);
+        assert_eq!(fourier_motzkin_with_fuel(&cons, 3), Some(FmResult::Sat));
     }
 
     #[test]

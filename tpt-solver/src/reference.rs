@@ -16,7 +16,7 @@ use tpt_solver_check::outcome::Outcome;
 use tpt_solver_check::sat::{check_model, Cnf, Model};
 use tpt_solver_core::engine::SolveResult;
 use tpt_solver_core::ir::{Lit, VarId};
-use tpt_solver_core::lra::{fourier_motzkin, FarkasCertificate, FmResult, LinConstraint};
+use tpt_solver_core::lra::{fourier_motzkin_with_fuel, FarkasCertificate, FmResult, LinConstraint};
 use tpt_solver_core::sat::SatAnswer;
 
 /// A formula in simple (non-branded) CNF: each literal is `var` (positive) or `-var`
@@ -344,8 +344,8 @@ pub fn solve_and_check_cdcl_with_proof(
 /// * **SAT** — Simplex extracts a satisfying assignment, which the kernel re-substitutes
 ///   into the original constraints via `tpt_solver_check::lra::check_lra_model`. If Simplex fails to produce
 ///   a model the verdict degrades to `Inconclusive` rather than a wrong `Accept`.
-pub fn solve_and_check_lra(constraints: &[LinConstraint], _fuel: u64) -> (SolveResult, Outcome) {
-    match fourier_motzkin(constraints) {
+pub fn solve_and_check_lra(constraints: &[LinConstraint], fuel: u64) -> (SolveResult, Outcome) {
+    match fourier_motzkin_with_fuel(constraints, fuel) {
         Some(FmResult::Unsat(cert)) => {
             let verdict = check_farkas(constraints, &cert);
             (SolveResult::Unsat, verdict)
@@ -371,7 +371,7 @@ pub fn solve_and_check_lra_with_cert(
     constraints: &[LinConstraint],
     fuel: u64,
 ) -> (SolveResult, Outcome, Option<FarkasCertificate>) {
-    match fourier_motzkin(constraints) {
+    match fourier_motzkin_with_fuel(constraints, fuel) {
         Some(FmResult::Unsat(cert)) => {
             let verdict = check_farkas(constraints, &cert);
             (SolveResult::Unsat, verdict, Some(cert))

@@ -1,3 +1,6 @@
 [toolchain]
 channel = "1.85"
 components = ["clippy", "rustfmt"]
+# The no_std CI job and the Pages playground build for wasm32; rustup only
+# installs that target for the pinned toolchain if it is listed here.
+targets = ["wasm32-unknown-unknown"]

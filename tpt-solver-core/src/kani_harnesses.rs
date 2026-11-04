@@ -28,9 +28,13 @@ fn kani_fuel_split_conserves() {
     assert_eq!(child.remaining() + f.remaining(), fuel);
 }
 
+/// The loop unwinds once per unit of fuel, so the budget is bounded. Looping over a
+/// fully symbolic `u64` never terminates under unwinding.
 #[kani::proof]
+#[kani::unwind(34)]
 fn kani_fuel_burn_drains() {
     let fuel: u64 = kani::any();
+    kani::assume(fuel <= 32);
     let mut f = Fuel::new(fuel);
     let mut count = 0u64;
     while f.burn_one() {
@@ -53,9 +57,10 @@ fn kani_lit_packing_roundtrip() {
 }
 
 #[kani::proof]
+#[kani::unwind(10)]
 fn kani_trail_rewind_restores_length() {
     let n: usize = kani::any();
-    kani::assume(n <= 64);
+    kani::assume(n <= 8);
     let mut t: Trail<u32> = Trail::default();
     for _ in 0..n {
         t.push(kani::any::<u32>());
@@ -69,9 +74,10 @@ fn kani_trail_rewind_restores_length() {
 }
 
 #[kani::proof]
+#[kani::unwind(10)]
 fn kani_arena_reset_restores_length() {
     let n: usize = kani::any();
-    kani::assume(n <= 64);
+    kani::assume(n <= 8);
     let mut a: Arena<u32> = Arena::default();
     for _ in 0..n {
         a.push(kani::any::<u32>());

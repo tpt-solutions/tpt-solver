@@ -102,8 +102,16 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: kani-verifier
+      - name: Cache the Kani toolchain and CBMC bundle
+        # `cargo kani setup` downloads CBMC and a nightly toolchain into ~/.kani on
+        # every run. Bump the key suffix if the kani-verifier version is pinned.
+        uses: actions/cache@v4
+        with:
+          path: ~/.kani
+          key: kani-${{ runner.os }}-v1
       - name: Set up Kani
         run: cargo kani setup
+      - uses: Swatinem/rust-cache@v2
       - name: Run Kani harnesses (core)
         # `cargo kani` provides the `kani` crate and sets `cfg(kani)`; no Cargo
         # dependency or feature flag is required.
