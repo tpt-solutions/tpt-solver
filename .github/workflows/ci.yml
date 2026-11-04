@@ -5,6 +5,13 @@ on:
     branches: [master]
   pull_request:
 
+# Several jobs build the whole workspace, including tpt-solver-py, on runners
+# whose default python3 is newer than PyO3 0.23 supports (3.14 on
+# ubuntu-latest). The extension is never run from these jobs, so accept the
+# newer interpreter through the stable ABI. Drop this once PyO3 is upgraded.
+env:
+  PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+
 jobs:
   lint:
     name: Format, clippy and docs

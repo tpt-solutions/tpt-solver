@@ -27,9 +27,12 @@ jobs:
           workspaces: tpt-solver-py
       - name: Build and install the extension module
         working-directory: tpt-solver-py
+        shell: bash
         run: |
           python -m pip install --upgrade pip maturin pytest
-          maturin develop --release
+          # maturin develop needs a virtualenv; build a wheel and install it into the setup-python interpreter instead.
+          maturin build --release --out "$RUNNER_TEMP/wheels"
+          python -m pip install --force-reinstall "$RUNNER_TEMP"/wheels/*.whl
       - name: Run pytest
         working-directory: tpt-solver-py
         run: python -m pytest tests -v
