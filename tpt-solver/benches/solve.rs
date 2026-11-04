@@ -3,7 +3,9 @@
 //! Run with `cargo bench -p tpt-solver`. Each group times the work that a user sees:
 //! parsing, the engine, and the checker that revalidates the answer.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, Criterion};
 use tpt_solver::api::{solve_str, Format, Options};
 use tpt_solver::policy::solve_cnf_certified;
 use tpt_solver::reference::Problem;
