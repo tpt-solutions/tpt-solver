@@ -112,7 +112,7 @@ jobs:
       - name: Cache the Kani toolchain and CBMC bundle
         # `cargo kani setup` downloads CBMC and a nightly toolchain into ~/.kani on
         # every run. Bump the key suffix if the kani-verifier version is pinned.
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.kani
           key: kani-${{ runner.os }}-v1
