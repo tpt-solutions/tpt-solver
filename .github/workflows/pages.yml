@@ -38,7 +38,7 @@ jobs:
           cp -r docs/book/. site/
           cp -r tpt-solver-wasm/web/. site/playground/
           rm -rf site/playground/LICENSE-* site/playground/*.md
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
