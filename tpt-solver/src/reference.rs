@@ -546,10 +546,12 @@ mod tests {
         // x >= 1  (=> -x <= -1)  and  x <= 0  => infeasible
         let cons = vec![
             LinConstraint {
+                strict: false,
                 coeffs: vec![Rational::from_i64(-1)],
                 rhs: Rational::from_i64(-1),
             },
             LinConstraint {
+                strict: false,
                 coeffs: vec![Rational::from_i64(1)],
                 rhs: Rational::from_i64(0),
             },
@@ -567,22 +569,27 @@ mod tests {
         // 0 <= x <= 5, 0 <= y <= 5, x + y <= 8  => feasible
         let cons = vec![
             LinConstraint {
+                strict: false,
                 coeffs: vec![Rational::from_i64(1), Rational::from_i64(0)],
                 rhs: Rational::from_i64(5),
             },
             LinConstraint {
+                strict: false,
                 coeffs: vec![Rational::from_i64(-1), Rational::from_i64(0)],
                 rhs: Rational::from_i64(0),
             },
             LinConstraint {
+                strict: false,
                 coeffs: vec![Rational::from_i64(0), Rational::from_i64(1)],
                 rhs: Rational::from_i64(5),
             },
             LinConstraint {
+                strict: false,
                 coeffs: vec![Rational::from_i64(0), Rational::from_i64(-1)],
                 rhs: Rational::from_i64(0),
             },
             LinConstraint {
+                strict: false,
                 coeffs: vec![Rational::from_i64(1), Rational::from_i64(1)],
                 rhs: Rational::from_i64(8),
             },

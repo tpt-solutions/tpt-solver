@@ -42,10 +42,12 @@ fn lra_example() {
     let zero = Rational::zero();
     let constraints = vec![
         LinConstraint {
+            strict: false,
             coeffs: vec![neg_one],
             rhs: neg_one,
         },
         LinConstraint {
+            strict: false,
             coeffs: vec![one],
             rhs: zero,
         },

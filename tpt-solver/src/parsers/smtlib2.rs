@@ -11,9 +11,9 @@
 //! * Commands: `set-logic`, `set-option`, `declare-fun`/`declare-const`,
 //!   `assert`, `check-sat`, `get-model`, `exit`, `push`/`pop` (accepted/no-op),
 //!   `reset`.
-//! * Boolean connectives `and or not => xor ite` and comparison `= < <= > >=`
-//!   (strict `<`/`>` are treated as their non-strict counterparts — a documented
-//!   limitation of exact rational arithmetic over the reals).
+//! * Boolean connectives `and or not => xor ite` and comparison `= < <= > >=`.
+//!   Strict `<`/`>` are exact: they become strict [`LinConstraint`]s, not their
+//!   non-strict counterparts.
 //! * Arithmetic `+ - * /` where `*`/`/` take a constant numeric operand, so the term
 //!   stays *linear* (QF_LRA). Integer-sorted variables are handled as reals.
 //! * Bit vectors (`QF_BV`): `(_ BitVec n)` sorts with `n <= 64`, literals
@@ -748,17 +748,14 @@ fn collect_constraints(
             }
             negate_comparison(&args[0], ctx, out)
         }
-        Term::App(Op::Le, args) => mk_cmp(args, ctx, out, CmpDir::Le),
-        Term::App(Op::Lt, args) => {
-            // Strict inequality is approximated by its non-strict form.
-            mk_cmp(args, ctx, out, CmpDir::Le)
-        }
-        Term::App(Op::Ge, args) => mk_cmp(args, ctx, out, CmpDir::Ge),
-        Term::App(Op::Gt, args) => mk_cmp(args, ctx, out, CmpDir::Ge),
+        Term::App(Op::Le, args) => mk_cmp(args, ctx, out, CmpDir::Le, false),
+        Term::App(Op::Lt, args) => mk_cmp(args, ctx, out, CmpDir::Le, true),
+        Term::App(Op::Ge, args) => mk_cmp(args, ctx, out, CmpDir::Ge, false),
+        Term::App(Op::Gt, args) => mk_cmp(args, ctx, out, CmpDir::Ge, true),
         Term::App(Op::Eq, args) => {
             // a = b  =>  a <= b  and  b <= a
-            mk_cmp(args, ctx, out, CmpDir::Le)?;
-            mk_cmp(args, ctx, out, CmpDir::Ge)
+            mk_cmp(args, ctx, out, CmpDir::Le, false)?;
+            mk_cmp(args, ctx, out, CmpDir::Ge, false)
         }
         _ => Err(SmtError::Unsupported(
             "LRA lowering supports only conjunctions of linear comparisons".into(),
@@ -771,11 +768,14 @@ enum CmpDir {
     Ge,
 }
 
+/// Lowers `args[0] R args[1]` where `R` is `<=` (`CmpDir::Le`) or `>=` (`CmpDir::Ge`),
+/// strict when `strict` is set.
 fn mk_cmp(
     args: &[Term],
     ctx: &mut LraCtx,
     out: &mut Vec<LinConstraint>,
     dir: CmpDir,
+    strict: bool,
 ) -> Result<(), SmtError> {
     if args.len() != 2 {
         return Err(SmtError::BadArity("comparison expects 2 arguments".into()));
@@ -801,7 +801,11 @@ fn mk_cmp(
             .add(q.constant.neg())
             .ok_or_else(|| SmtError::BadNumber("arithmetic overflow".into()))?,
     };
-    out.push(LinConstraint { coeffs, rhs });
+    out.push(LinConstraint {
+        coeffs,
+        rhs,
+        strict,
+    });
     Ok(())
 }
 
@@ -810,12 +814,16 @@ fn negate_comparison(
     ctx: &mut LraCtx,
     out: &mut Vec<LinConstraint>,
 ) -> Result<(), SmtError> {
-    // not(a R b) where R in {<=,<,>=,>}. With the strict->non-strict approximation:
-    //   not(a <= b) = a > b  =>  b <= a
-    //   not(a >= b) = a < b  =>  a <= b
+    // Exact negations of the comparisons:
+    //   not(a <= b) = a > b   =>  b < a   (strict)
+    //   not(a <  b) = a >= b  =>  b <= a
+    //   not(a >= b) = a < b   =>  a < b   (strict)
+    //   not(a >  b) = a <= b  =>  a <= b
     match term {
-        Term::App(Op::Le, a) | Term::App(Op::Lt, a) => mk_cmp(a, ctx, out, CmpDir::Ge),
-        Term::App(Op::Ge, a) | Term::App(Op::Gt, a) => mk_cmp(a, ctx, out, CmpDir::Le),
+        Term::App(Op::Le, a) => mk_cmp(a, ctx, out, CmpDir::Ge, true),
+        Term::App(Op::Lt, a) => mk_cmp(a, ctx, out, CmpDir::Ge, false),
+        Term::App(Op::Ge, a) => mk_cmp(a, ctx, out, CmpDir::Le, true),
+        Term::App(Op::Gt, a) => mk_cmp(a, ctx, out, CmpDir::Le, false),
         Term::App(Op::Eq, a) => {
             // not(a = b): a < b or a > b  =>  a disjunction, unsupported in pure LRA.
             let _ = a;
