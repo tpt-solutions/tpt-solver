@@ -16,10 +16,13 @@ use tpt_solver_core::rational::Rational;
 
 /// Verify a Farkas certificate against the original constraints.
 ///
-/// Returns [`Outcome::Accept`] iff every multiplier is nonnegative, the combined
-/// constraint's coefficients are all zero, and the combined right-hand side is
-/// strictly negative (i.e. `0 < 0`). Returns [`Outcome::Reject`] if the combination
-/// fails to derive a contradiction, and [`Outcome::Inconclusive`] on malformed input
+/// Let `S = Σ mᵢ·rhsᵢ` and `R` be `<` if some strict constraint has `mᵢ > 0`, else
+/// `<=`. The combination derives `0 R S`. This is a contradiction exactly when the
+/// coefficients cancel and `0 R S` is false: `S < 0` for `<=`, or `S <= 0` for `<`.
+///
+/// Returns [`Outcome::Accept`] iff every multiplier is nonnegative, the coefficients
+/// cancel, and that contradiction holds. Returns [`Outcome::Reject`] if the
+/// combination fails to derive one, and [`Outcome::Inconclusive`] on malformed input
 /// or exact-arithmetic overflow.
 #[allow(clippy::needless_range_loop)]
 pub fn check_farkas(constraints: &[LinConstraint], cert: &FarkasCertificate) -> Outcome {
@@ -29,11 +32,15 @@ pub fn check_farkas(constraints: &[LinConstraint], cert: &FarkasCertificate) -> 
     let n_vars = constraints.first().map(|c| c.coeffs.len()).unwrap_or(0);
     let mut total_rhs = Rational::zero();
     let mut total_coeffs: Vec<Rational> = alloc::vec![Rational::zero(); n_vars];
+    let mut strict_used = false;
 
     for (i, c) in constraints.iter().enumerate() {
         let m = cert.multipliers[i];
         if m.is_negative() {
             return Outcome::Reject; // Farkas multipliers must be nonnegative
+        }
+        if c.strict && !m.is_zero() {
+            strict_used = true;
         }
         if c.coeffs.len() != n_vars {
             return Outcome::Inconclusive;
@@ -62,14 +69,20 @@ pub fn check_farkas(constraints: &[LinConstraint], cert: &FarkasCertificate) -> 
             return Outcome::Reject;
         }
     }
-    if total_rhs.is_negative() {
+    let contradiction = if strict_used {
+        !total_rhs.is_positive()
+    } else {
+        total_rhs.is_negative()
+    };
+    if contradiction {
         Outcome::Accept
     } else {
         Outcome::Reject
     }
 }
 
-/// Verify that `model` satisfies every constraint (`coeffs·model <= rhs`).
+/// Verify that `model` satisfies every constraint (`coeffs·model <= rhs`, or
+/// `< rhs` for a strict constraint).
 ///
 /// Returns [`Outcome::Accept`] if all hold, [`Outcome::Reject`] if any is violated,
 /// and [`Outcome::Inconclusive`] on a length mismatch or arithmetic overflow.
@@ -94,7 +107,12 @@ pub fn check_lra_model(constraints: &[LinConstraint], model: &[Rational]) -> Out
                 None => return Outcome::Inconclusive,
             };
         }
-        if lhs.cmp(c.rhs) == Ordering::Greater {
+        let violated = match lhs.cmp(c.rhs) {
+            Ordering::Greater => true,
+            Ordering::Equal => c.strict,
+            Ordering::Less => false,
+        };
+        if violated {
             return Outcome::Reject;
         }
     }
@@ -111,6 +129,7 @@ mod tests {
 
     fn c(coeffs: &[i64], rhs: i64) -> LinConstraint {
         LinConstraint {
+            strict: false,
             coeffs: coeffs.iter().map(|&x| Rational::from_i64(x)).collect(),
             rhs: Rational::from_i64(rhs),
         }
@@ -151,6 +170,42 @@ mod tests {
         let cons = vec![c(&[1, 1], 5)];
         let model = vec![Rational::from_i64(3)];
         assert!(check_lra_model(&cons, &model).is_inconclusive());
+    }
+
+    fn strict(coeffs: &[i64], rhs: i64) -> LinConstraint {
+        LinConstraint {
+            strict: true,
+            ..c(coeffs, rhs)
+        }
+    }
+
+    #[test]
+    fn strict_bound_refuted_by_farkas_at_equal_boundary() {
+        // x >= 1 and x < 1: certificate [1, 1] gives 0 < 0, a contradiction.
+        let cons = vec![c(&[-1], -1), strict(&[1], 1)];
+        let cert = FarkasCertificate {
+            multipliers: vec![Rational::from_i64(1), Rational::from_i64(1)],
+        };
+        assert!(check_farkas(&cons, &cert).is_accept());
+    }
+
+    #[test]
+    fn strict_certificate_without_strict_multiplier_is_not_a_contradiction() {
+        // x >= 1 and x <= 1 is satisfiable (x = 1). Zero multiplier on the strict
+        // constraint must not turn 0 <= 0 into a contradiction.
+        let cons = vec![c(&[-1], -1), strict(&[1], 1)];
+        let cert = FarkasCertificate {
+            multipliers: vec![Rational::from_i64(1), Rational::from_i64(0)],
+        };
+        assert!(check_farkas(&cons, &cert).is_reject());
+    }
+
+    #[test]
+    fn model_at_strict_boundary_is_rejected() {
+        // x < 1 with x = 1 violates the strict constraint.
+        let cons = vec![strict(&[1], 1)];
+        assert!(check_lra_model(&cons, &[Rational::from_i64(1)]).is_reject());
+        assert!(check_lra_model(&cons, &[Rational::from_i64(0)]).is_accept());
     }
 
     #[test]

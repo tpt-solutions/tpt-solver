@@ -10,14 +10,37 @@
 use crate::rational::Rational;
 use alloc::vec::Vec;
 
-/// A linear constraint in canonical `<=` form: `Σ coeffs[i]·x_i <= rhs`.
+/// A linear constraint in canonical form: `Σ coeffs[i]·x_i <= rhs`, or
+/// `Σ coeffs[i]·x_i < rhs` when [`strict`](Self::strict) is set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinConstraint {
     /// Coefficient of each variable, in a fixed variable order shared by every
     /// constraint in the system.
     pub coeffs: Vec<Rational>,
-    /// The right-hand side of the `<=` bound.
+    /// The right-hand side of the bound.
     pub rhs: Rational,
+    /// `true` for a strict inequality (`<`), `false` for `<=`.
+    pub strict: bool,
+}
+
+impl LinConstraint {
+    /// A non-strict constraint `coeffs·x <= rhs`.
+    pub fn le(coeffs: Vec<Rational>, rhs: Rational) -> Self {
+        Self {
+            coeffs,
+            rhs,
+            strict: false,
+        }
+    }
+
+    /// A strict constraint `coeffs·x < rhs`.
+    pub fn lt(coeffs: Vec<Rational>, rhs: Rational) -> Self {
+        Self {
+            coeffs,
+            rhs,
+            strict: true,
+        }
+    }
 }
 
 /// A Farkas certificate: nonnegative multipliers, one per original constraint, whose
@@ -41,6 +64,9 @@ pub enum FmResult {
 struct Internal {
     coeffs: Vec<Rational>,
     rhs: Rational,
+    /// `true` if the derived constraint is strict. A nonnegative combination is
+    /// strict as soon as one strict constraint with a positive multiplier takes part.
+    strict: bool,
     /// Accreted multipliers over the *original* constraints.
     mult: Vec<Rational>,
 }
@@ -77,6 +103,7 @@ pub fn fourier_motzkin_with_fuel(input: &[LinConstraint], fuel: u64) -> Option<F
             Internal {
                 coeffs: c.coeffs.clone(),
                 rhs: c.rhs,
+                strict: c.strict,
                 mult,
             }
         })
@@ -123,6 +150,7 @@ pub fn fourier_motzkin_with_fuel(input: &[LinConstraint], fuel: u64) -> Option<F
                 next.push(Internal {
                     coeffs: nc,
                     rhs: nrhs,
+                    strict: ui.strict || lj.strict,
                     mult: nmult,
                 });
             }
@@ -131,7 +159,14 @@ pub fn fourier_motzkin_with_fuel(input: &[LinConstraint], fuel: u64) -> Option<F
     }
 
     for c in &cons {
-        if c.coeffs.iter().all(|x| x.is_zero()) && c.rhs.is_negative() {
+        // With every variable eliminated the row reads `0 <= rhs` (or `0 < rhs` when
+        // strict). It is a contradiction when that fails.
+        let contradiction = if c.strict {
+            !c.rhs.is_positive()
+        } else {
+            c.rhs.is_negative()
+        };
+        if c.coeffs.iter().all(|x| x.is_zero()) && contradiction {
             return Some(FmResult::Unsat(FarkasCertificate {
                 multipliers: c.mult.clone(),
             }));
@@ -390,6 +425,41 @@ pub fn lra_model(constraints: &[LinConstraint]) -> Option<Option<Vec<Rational>>>
         // Vacuously feasible: the empty assignment satisfies the empty system.
         return Some(Some(Vec::new()));
     }
+    if !constraints.iter().any(|c| c.strict) {
+        return solve_nonstrict(constraints);
+    }
+    // Strict constraints `a·x < b` are not representable in the simplex, which only
+    // handles `<=`. Any model of the system `a·x <= b - ε` (ε > 0) is a model of the
+    // strict original, because `b - ε < b`. So search with a shrinking ε. A model
+    // found this way is exact. An infeasible shifted system does not prove the
+    // original infeasible, so that case stays undecided (`None`).
+    for shift_bits in [8_u32, 16, 24, 32, 48, 64, 96] {
+        let Some(eps) = Rational::new(1, 1_i128 << shift_bits) else {
+            continue;
+        };
+        let shifted: Option<Vec<LinConstraint>> = constraints
+            .iter()
+            .map(|c| {
+                let rhs = if c.strict {
+                    c.rhs.add(eps.neg())?
+                } else {
+                    c.rhs
+                };
+                Some(LinConstraint::le(c.coeffs.clone(), rhs))
+            })
+            .collect();
+        let Some(shifted) = shifted else {
+            continue;
+        };
+        if let Some(Some(model)) = solve_nonstrict(&shifted) {
+            return Some(Some(model));
+        }
+    }
+    None
+}
+
+/// Simplex over non-strict `<=` constraints only. Callers must not pass strict ones.
+fn solve_nonstrict(constraints: &[LinConstraint]) -> Option<Option<Vec<Rational>>> {
     let mut tab = Tableau::build(constraints)?;
     // Iteration ceiling scales with problem size; this is a *decision* budget, not a
     // soundness bound — exhausting it only yields `None`.
@@ -404,6 +474,7 @@ mod tests {
 
     fn c(coeffs: &[i64], rhs: i64) -> LinConstraint {
         LinConstraint {
+            strict: false,
             coeffs: coeffs.iter().map(|&x| Rational::from_i64(x)).collect(),
             rhs: Rational::from_i64(rhs),
         }
@@ -488,5 +559,77 @@ mod tests {
             Some(None) => {} // expected infeasible
             other => panic!("expected Some(None), got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod strict_tests {
+    use super::*;
+    use alloc::vec;
+
+    fn r(n: i64) -> Rational {
+        Rational::from_i64(n)
+    }
+
+    fn le(coeffs: &[i64], rhs: i64) -> LinConstraint {
+        LinConstraint::le(coeffs.iter().map(|&c| r(c)).collect(), r(rhs))
+    }
+
+    fn lt(coeffs: &[i64], rhs: i64) -> LinConstraint {
+        LinConstraint::lt(coeffs.iter().map(|&c| r(c)).collect(), r(rhs))
+    }
+
+    #[test]
+    fn fm_refutes_strict_bound_meeting_equal_bound() {
+        // x >= 1 (-x <= -1) and x < 1: contradiction.
+        let sys = vec![le(&[-1], -1), lt(&[1], 1)];
+        assert!(matches!(fourier_motzkin(&sys), Some(FmResult::Unsat(_))));
+    }
+
+    #[test]
+    fn fm_keeps_satisfiable_strict_system_sat() {
+        // x >= 1 and x < 2.
+        let sys = vec![le(&[-1], -1), lt(&[1], 2)];
+        assert_eq!(fourier_motzkin(&sys), Some(FmResult::Sat));
+    }
+
+    #[test]
+    fn fm_strict_combination_chain() {
+        // y < x, x <= 0, y >= 0 is unsat: derives 0 < 0 through a strict step.
+        // -x + y < 0 ; x <= 0 ; -y <= 0
+        let sys = vec![lt(&[-1, 1], 0), le(&[1, 0], 0), le(&[0, -1], 0)];
+        assert!(matches!(fourier_motzkin(&sys), Some(FmResult::Unsat(_))));
+    }
+
+    #[test]
+    fn model_search_finds_point_strictly_inside_tiny_interval() {
+        // 0 < x < 1e-6, a tiny open interval the plain simplex would miss unless
+        // the margin is small enough.
+        let eps_hi = Rational::new(1, 1_000_000).unwrap();
+        let sys = vec![
+            LinConstraint::lt(vec![r(-1)], r(0)),
+            LinConstraint::lt(vec![r(1)], eps_hi),
+        ];
+        let model = match lra_model(&sys) {
+            Some(Some(m)) => m,
+            other => panic!("expected a model, got {other:?}"),
+        };
+        let x = model[0];
+        assert!(x.is_positive(), "x must be > 0");
+        assert!(
+            x.cmp(eps_hi) == core::cmp::Ordering::Less,
+            "x must be < 1e-6"
+        );
+    }
+
+    #[test]
+    fn model_search_is_none_for_empty_open_interval() {
+        // x > 1 and x < 1 has no model; the search must not invent one.
+        let sys = vec![
+            LinConstraint::lt(vec![r(-1)], r(-1)),
+            LinConstraint::lt(vec![r(1)], r(1)),
+        ];
+        assert!(!matches!(lra_model(&sys), Some(Some(_))));
     }
 }

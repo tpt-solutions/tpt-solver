@@ -17,6 +17,7 @@ use proptest::prelude::*;
 
 fn mk_constraint(coeffs: &[i64], rhs: i64) -> LinConstraint {
     LinConstraint {
+        strict: false,
         coeffs: coeffs.iter().map(|&c| Rational::from_i64(c)).collect(),
         rhs: Rational::from_i64(rhs),
     }

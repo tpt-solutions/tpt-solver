@@ -256,6 +256,7 @@ fn gen_lra_problem(rng: &mut Lcg, n_vars: usize, n_cons: usize) -> Vec<(Vec<i64>
 fn lra_to_constraints(cons: &[(Vec<i64>, i64)]) -> Vec<LinConstraint> {
     cons.iter()
         .map(|(coeffs, rhs)| LinConstraint {
+            strict: false,
             coeffs: coeffs.iter().map(|&c| Rational::from_i64(c)).collect(),
             rhs: Rational::from_i64(*rhs),
         })

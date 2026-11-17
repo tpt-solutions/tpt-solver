@@ -38,6 +38,7 @@ fn satisfiable_formula_never_proved_unsat() {
 #[test]
 fn zero_farkas_multiplier_never_certifies() {
     let c = LinConstraint {
+        strict: false,
         coeffs: vec![Rational::zero()],
         rhs: Rational::from_i64(-1),
     };

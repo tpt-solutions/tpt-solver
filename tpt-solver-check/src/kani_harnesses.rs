@@ -44,6 +44,7 @@ fn kani_satisfiable_formula_never_proved_unsat() {
 #[kani::proof]
 fn kani_zero_farkas_multiplier_never_certifies() {
     let constraint = LinConstraint {
+        strict: false,
         coeffs: vec![Rational::zero()],
         rhs: Rational::from_i64(-1),
     };

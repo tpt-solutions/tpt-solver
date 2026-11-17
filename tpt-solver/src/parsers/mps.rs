@@ -331,6 +331,7 @@ pub fn parse_mps_located(input: &str) -> Result<LraProblem, Located<MpsError>> {
         }
         if let Some(u) = hi {
             constraints.push(LinConstraint {
+                strict: false,
                 coeffs: coeffs.clone(),
                 rhs: u,
             });
@@ -338,6 +339,7 @@ pub fn parse_mps_located(input: &str) -> Result<LraProblem, Located<MpsError>> {
         if let Some(l) = lo {
             let neg: Vec<Rational> = coeffs.iter().map(|c| c.neg()).collect();
             constraints.push(LinConstraint {
+                strict: false,
                 coeffs: neg,
                 rhs: l.neg(),
             });
@@ -350,12 +352,17 @@ pub fn parse_mps_located(input: &str) -> Result<LraProblem, Located<MpsError>> {
         if let Some(u) = b.hi {
             let mut coeffs = vec![Rational::zero(); n];
             coeffs[col] = Rational::from_i64(1);
-            constraints.push(LinConstraint { coeffs, rhs: u });
+            constraints.push(LinConstraint {
+                strict: false,
+                coeffs,
+                rhs: u,
+            });
         }
         if let Some(l) = b.lo {
             let mut coeffs = vec![Rational::zero(); n];
             coeffs[col] = Rational::from_i64(-1);
             constraints.push(LinConstraint {
+                strict: false,
                 coeffs,
                 rhs: l.neg(),
             });
@@ -618,10 +625,12 @@ ENDATA
             solve_and_check_lra(&cons, 1_000_000).0
         };
         let pin = |v: i64| LinConstraint {
+            strict: false,
             coeffs: vec![Rational::from_i64(1)],
             rhs: Rational::from_i64(v),
         };
         let pin_min = |v: i64| LinConstraint {
+            strict: false,
             coeffs: vec![Rational::from_i64(-1)],
             rhs: Rational::from_i64(-v),
         };
