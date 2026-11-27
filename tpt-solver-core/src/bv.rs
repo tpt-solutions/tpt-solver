@@ -697,6 +697,74 @@ impl Blaster {
         }
     }
 
+    /// A literal that is true exactly when `x == y`.
+    fn eq_lit(&mut self, x: &[i32], y: &[i32]) -> i32 {
+        let mut acc = self.true_lit();
+        for k in 0..x.len().min(y.len()) {
+            let d = self.g_xor(x[k], y[k]);
+            let same = self.g_not(d);
+            acc = self.g_and(acc, same);
+        }
+        acc
+    }
+
+    /// A literal that is true exactly when `x <u y`.
+    fn ult_lit(&mut self, x: &[i32], y: &[i32]) -> i32 {
+        let mut e = self.true_lit();
+        let mut acc = self.false_lit();
+        for k in (0..x.len()).rev() {
+            let nx = self.g_not(x[k]);
+            let t = self.g_and(e, nx);
+            let d = self.g_and(t, y[k]);
+            acc = self.g_or(acc, d);
+            let x1 = self.g_xor(x[k], y[k]);
+            let xnor = self.g_not(x1);
+            e = self.g_and(e, xnor);
+        }
+        acc
+    }
+
+    /// Tseitin-encodes `f`, returning a literal equivalent to it.
+    fn formula_lit(&mut self, f: &BvFormula, var_bits: &mut [Vec<i32>]) -> Option<i32> {
+        Some(match f {
+            BvFormula::Const(true) => self.true_lit(),
+            BvFormula::Const(false) => self.false_lit(),
+            BvFormula::Atom(BvAssertion::Eq(l, r)) => {
+                let lb = self.term(l, var_bits)?;
+                let rb = self.term(r, var_bits)?;
+                if lb.len() != rb.len() {
+                    return None;
+                }
+                self.eq_lit(&lb, &rb)
+            }
+            BvFormula::Atom(BvAssertion::Ult(l, r)) => {
+                let lb = self.term(l, var_bits)?;
+                let rb = self.term(r, var_bits)?;
+                if lb.len() != rb.len() {
+                    return None;
+                }
+                self.ult_lit(&lb, &rb)
+            }
+            BvFormula::Not(inner) => -self.formula_lit(inner, var_bits)?,
+            BvFormula::And(parts) => {
+                let mut acc = self.true_lit();
+                for part in parts {
+                    let lit = self.formula_lit(part, var_bits)?;
+                    acc = self.g_and(acc, lit);
+                }
+                acc
+            }
+            BvFormula::Or(parts) => {
+                let mut acc = self.false_lit();
+                for part in parts {
+                    let lit = self.formula_lit(part, var_bits)?;
+                    acc = self.g_or(acc, lit);
+                }
+                acc
+            }
+        })
+    }
+
     /// Encode `x <u y` via an equality-chain comparator.
     fn blast_ult(&mut self, x: &[i32], y: &[i32]) {
         let mut e = self.true_lit();
@@ -720,6 +788,62 @@ impl Blaster {
             None => self.unit(self.false_lit()),
         }
     }
+}
+
+/// A Boolean combination of bit-vector atoms. Each top-level formula must
+/// hold. Atoms are the same equalities and unsigned comparisons as
+/// [`BvAssertion`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BvFormula {
+    /// A constant.
+    Const(bool),
+    /// An equality or an unsigned comparison.
+    Atom(BvAssertion),
+    /// Negation.
+    Not(Box<BvFormula>),
+    /// Conjunction. The empty conjunction is true.
+    And(Vec<BvFormula>),
+    /// Disjunction. The empty disjunction is false.
+    Or(Vec<BvFormula>),
+}
+
+/// Bit-blast a conjunction of Boolean formulas into CNF. Returns `None` on
+/// malformed input, as [`blast_bv`] does.
+pub fn blast_formulas(var_count: u32, formulas: &[BvFormula]) -> Option<BlastedBv> {
+    let mut blaster = Blaster::new();
+    let mut var_bits: Vec<Vec<i32>> = vec![Vec::new(); var_count as usize];
+    for f in formulas {
+        let lit = blaster.formula_lit(f, &mut var_bits)?;
+        blaster.unit(lit);
+    }
+    Some(BlastedBv {
+        var_count: blaster.next_var - 1,
+        clauses: blaster.clauses,
+        var_bits,
+    })
+}
+
+/// Whether a formula holds under `values`. `None` on malformed input.
+fn formula_holds(f: &BvFormula, values: &[u128]) -> Option<bool> {
+    Some(match f {
+        BvFormula::Const(b) => *b,
+        BvFormula::Atom(a) => assertion_holds(a, values)?,
+        BvFormula::Not(inner) => !formula_holds(inner, values)?,
+        BvFormula::And(parts) => {
+            let mut all = true;
+            for part in parts {
+                all &= formula_holds(part, values)?;
+            }
+            all
+        }
+        BvFormula::Or(parts) => {
+            let mut any = false;
+            for part in parts {
+                any |= formula_holds(part, values)?;
+            }
+            any
+        }
+    })
 }
 
 /// Bit-blast a conjunction of assertions into CNF. Returns `None` on malformed
@@ -819,6 +943,48 @@ pub fn solve_bv(var_count: u32, assertions: &[BvAssertion], fuel: u64) -> Option
         })),
         SolveResult::Unknown => None,
     }
+}
+
+/// Decides a conjunction of Boolean formulas over bit-vector atoms. Like
+/// [`solve_bv`], a SAT model is self-checked, and an UNSAT answer carries the
+/// blast and its proof.
+pub fn solve_bv_formulas(var_count: u32, formulas: &[BvFormula], fuel: u64) -> Option<BvOutcome> {
+    let blasted = blast_formulas(var_count, formulas)?;
+    let ans = crate::sat::solve_cnf(blasted.var_count, &blasted.clauses, fuel);
+    match ans.result {
+        SolveResult::Sat => {
+            let values = model_values(var_count, &blasted.var_bits, &ans.model?)?;
+            for f in formulas {
+                if !formula_holds(f, &values)? {
+                    return None;
+                }
+            }
+            Some(BvOutcome::Sat(BvModel { values }))
+        }
+        SolveResult::Unsat => Some(BvOutcome::Unsat(BvUnsatCert {
+            var_count: blasted.var_count,
+            clauses: blasted.clauses,
+            proof: ans.proof,
+        })),
+        SolveResult::Unknown => None,
+    }
+}
+
+/// Reads each variable's word value from a SAT model.
+fn model_values(var_count: u32, var_bits: &[Vec<i32>], bits: &[bool]) -> Option<Vec<u128>> {
+    let mut values = vec![0u128; var_count as usize];
+    for (id, wb) in var_bits.iter().enumerate() {
+        let mut v = 0u128;
+        for (k, &l) in wb.iter().enumerate() {
+            let assigned = *bits.get((l.unsigned_abs() - 1) as usize)?;
+            let lit_true = if l > 0 { assigned } else { !assigned };
+            if lit_true && k < 128 {
+                v |= 1u128 << k;
+            }
+        }
+        values[id] = v;
+    }
+    Some(values)
 }
 
 #[cfg(test)]
@@ -1199,6 +1365,125 @@ mod oracle {
                     // crate sits above this one).
                 }
                 None => { /* fuel/malformed: skip */ }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod formula_tests {
+    use super::*;
+
+    fn v(id: u32, w: u8) -> BvTerm {
+        BvTerm::var(id, w).unwrap()
+    }
+
+    fn k(w: u8, value: u128) -> BvTerm {
+        BvTerm::constant(w, value).unwrap()
+    }
+
+    fn eq_atom(l: BvTerm, r: BvTerm) -> BvFormula {
+        BvFormula::Atom(BvAssertion::eq(l, r).unwrap())
+    }
+
+    fn ult_atom(l: BvTerm, r: BvTerm) -> BvFormula {
+        BvFormula::Atom(BvAssertion::ult(l, r).unwrap())
+    }
+
+    #[test]
+    fn disjunction_forces_a_model_value() {
+        // (x == 2 or x == 3) and x < 3 forces x == 2.
+        let x = v(0, 2);
+        let formulas = vec![
+            BvFormula::Or(vec![
+                eq_atom(x.clone(), k(2, 2)),
+                eq_atom(x.clone(), k(2, 3)),
+            ]),
+            ult_atom(x, k(2, 3)),
+        ];
+        match solve_bv_formulas(1, &formulas, 10_000_000) {
+            Some(BvOutcome::Sat(m)) => assert_eq!(m.values[0], 2),
+            other => panic!("expected SAT with x == 2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn excluding_every_value_is_unsat() {
+        // x is 0 or 1, and not 0, and not 1: UNSAT, with a certificate.
+        let x = v(0, 1);
+        let formulas = vec![
+            BvFormula::Or(vec![
+                eq_atom(x.clone(), k(1, 0)),
+                eq_atom(x.clone(), k(1, 1)),
+            ]),
+            BvFormula::Not(Box::new(eq_atom(x.clone(), k(1, 0)))),
+            BvFormula::Not(Box::new(eq_atom(x, k(1, 1)))),
+        ];
+        assert!(matches!(
+            solve_bv_formulas(1, &formulas, 10_000_000),
+            Some(BvOutcome::Unsat(_))
+        ));
+    }
+
+    /// Random small formulas over two 2-bit variables agree with brute force:
+    /// SAT exactly when some assignment satisfies them, and a SAT model
+    /// satisfies every formula.
+    #[test]
+    fn formulas_agree_with_brute_force() {
+        struct Lcg(u64);
+        impl Lcg {
+            fn below(&mut self, n: u64) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (self.0 >> 33) % n
+            }
+        }
+        fn term(rng: &mut Lcg) -> BvTerm {
+            match rng.below(4) {
+                0 => v(0, 2),
+                1 => v(1, 2),
+                2 => k(2, u128::from(rng.below(4))),
+                _ => BvTerm::add(v(0, 2), k(2, u128::from(rng.below(4)))).unwrap(),
+            }
+        }
+        fn formula(rng: &mut Lcg, depth: u32) -> BvFormula {
+            if depth == 0 || rng.below(3) == 0 {
+                let (l, r) = (term(rng), term(rng));
+                return if rng.below(2) == 0 {
+                    eq_atom(l, r)
+                } else {
+                    ult_atom(l, r)
+                };
+            }
+            match rng.below(3) {
+                0 => BvFormula::Not(Box::new(formula(rng, depth - 1))),
+                1 => BvFormula::And(vec![formula(rng, depth - 1), formula(rng, depth - 1)]),
+                _ => BvFormula::Or(vec![formula(rng, depth - 1), formula(rng, depth - 1)]),
+            }
+        }
+        let mut rng = Lcg(0x5eed);
+        for _ in 0..200 {
+            let f = formula(&mut rng, 3);
+            let formulas = vec![f.clone()];
+            let brute = (0..16u128).any(|code| {
+                let values = [code & 3, code >> 2];
+                formula_holds(&f, &values) == Some(true)
+            });
+            match solve_bv_formulas(2, &formulas, 10_000_000) {
+                Some(BvOutcome::Sat(m)) => {
+                    assert!(brute, "solver says SAT, brute force says UNSAT: {f:?}");
+                    assert_eq!(formula_holds(&f, &m.values), Some(true));
+                }
+                Some(BvOutcome::Unsat(_)) => {
+                    assert!(
+                        !brute,
+                        "solver says UNSAT, brute force found a model: {f:?}"
+                    );
+                }
+                None => panic!("solver gave no answer for {f:?}"),
             }
         }
     }
