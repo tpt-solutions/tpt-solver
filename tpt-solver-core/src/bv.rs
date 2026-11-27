@@ -49,6 +49,8 @@ pub enum BvBinOp {
     Add,
     /// Two's-complement subtraction (wraps mod 2^width).
     Sub,
+    /// Multiplication (wraps mod 2^width).
+    Mul,
 }
 
 /// A word-level bit-vector term.
@@ -202,6 +204,13 @@ impl BvTerm {
         BvTerm::boxed_bin(BvBinOp::Sub, lhs, rhs)
     }
 
+    /// Multiplication modulo `2^width`; `None` on a width mismatch. The name
+    /// matches `add` and `sub`, so the trait-confusion lint is allowed here.
+    #[allow(clippy::should_implement_trait)]
+    pub fn mul(lhs: BvTerm, rhs: BvTerm) -> Option<BvTerm> {
+        BvTerm::boxed_bin(BvBinOp::Mul, lhs, rhs)
+    }
+
     /// Bitwise negation.
     #[allow(clippy::should_implement_trait)]
     pub fn not(arg: BvTerm) -> Option<BvTerm> {
@@ -336,6 +345,7 @@ pub fn eval_bv(term: &BvTerm, env: &[u128]) -> Option<u128> {
                     BvBinOp::Xor => Some(l ^ r),
                     BvBinOp::Add => Some(l.wrapping_add(r) & mask(w)),
                     BvBinOp::Sub => Some(l.wrapping_sub(r) & mask(w)),
+                    BvBinOp::Mul => Some(l.wrapping_mul(r) & mask(w)),
                 }
             }
             BvTerm::Shift {
@@ -490,6 +500,21 @@ impl Blaster {
         z
     }
 
+    /// Shift-and-add multiplication, truncated to the operand width. Row `i`
+    /// is `l` shifted left by `i` and gated by bit `i` of `r`.
+    fn mul_bits(&mut self, l: &[i32], r: &[i32]) -> Vec<i32> {
+        let w = l.len().min(r.len());
+        let mut acc = vec![self.false_lit(); w];
+        for i in 0..w {
+            let mut row = vec![self.false_lit(); w];
+            for k in i..w {
+                row[k] = self.g_and(l[k - i], r[i]);
+            }
+            acc = self.add_bits(&acc, &row, self.false_lit());
+        }
+        acc
+    }
+
     /// Ripple-carry addition of two equal-length bit vectors.
     fn add_bits(&mut self, x: &[i32], y: &[i32], carry_in: i32) -> Vec<i32> {
         let mut out = Vec::with_capacity(x.len());
@@ -629,6 +654,7 @@ impl Blaster {
                         let nr = self.neg_bits(&r);
                         Some(self.add_bits(&l, &nr, self.false_lit()))
                     }
+                    BvBinOp::Mul => Some(self.mul_bits(&l, &r)),
                     BvBinOp::And | BvBinOp::Or | BvBinOp::Xor => {
                         let mut out = Vec::with_capacity(l.len());
                         for k in 0..l.len().min(r.len()) {
@@ -1484,6 +1510,46 @@ mod formula_tests {
                     );
                 }
                 None => panic!("solver gave no answer for {f:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn multiplication_by_an_odd_constant_has_one_solution() {
+        // 3 * x == 6 (mod 8) has the unique solution x == 2.
+        let x = v(0, 3);
+        let formulas = vec![eq_atom(BvTerm::mul(k(3, 3), x).unwrap(), k(3, 6))];
+        match solve_bv_formulas(1, &formulas, 10_000_000) {
+            Some(BvOutcome::Sat(m)) => assert_eq!(m.values[0], 2),
+            other => panic!("expected x == 2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiplication_by_two_is_never_odd() {
+        // 2 * x == 1 (mod 8) has no solution.
+        let x = v(0, 3);
+        let formulas = vec![eq_atom(BvTerm::mul(k(3, 2), x).unwrap(), k(3, 1))];
+        assert!(matches!(
+            solve_bv_formulas(1, &formulas, 10_000_000),
+            Some(BvOutcome::Unsat(_))
+        ));
+    }
+
+    #[test]
+    fn multiplication_agrees_with_brute_force_on_every_target() {
+        for target in 0..8u128 {
+            let f = eq_atom(BvTerm::mul(v(0, 3), v(1, 3)).unwrap(), k(3, target));
+            let brute = (0..8u128).any(|a| (0..8u128).any(|b| (a * b) % 8 == target));
+            match solve_bv_formulas(2, &[f.clone()], 10_000_000) {
+                Some(BvOutcome::Sat(m)) => {
+                    assert!(brute, "target {target}: solver SAT, brute UNSAT");
+                    assert_eq!(formula_holds(&f, &m.values), Some(true));
+                }
+                Some(BvOutcome::Unsat(_)) => {
+                    assert!(!brute, "target {target}: solver UNSAT, brute found a model");
+                }
+                None => panic!("no answer for target {target}"),
             }
         }
     }

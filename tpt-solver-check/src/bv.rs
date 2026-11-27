@@ -48,6 +48,7 @@ fn eval(term: &BvTerm, env: &[u128], d: u32) -> Option<u128> {
                 BvBinOp::Xor => Some(l ^ r),
                 BvBinOp::Add => Some(l.wrapping_add(r) & mask(w)),
                 BvBinOp::Sub => Some(l.wrapping_sub(r) & mask(w)),
+                BvBinOp::Mul => Some(l.wrapping_mul(r) & mask(w)),
             }
         }
         BvTerm::Shift { left, arg, amount } => {
