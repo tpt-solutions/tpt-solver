@@ -1,6 +1,6 @@
 //! Fixed-width bit-vector theory — a practical QF_BV fragment (Phase 5).
 //!
-//! Terms are word-level trees over variables and constants of width 1..=64,
+//! Terms are word-level trees over variables and constants of width 1..=128,
 //! with bitwise (`and`/`or`/`xor`/`not`), two's-complement (`add`/`sub`/
 //! `neg`), constant shifts, `concat`, and `extract`. Assertions are unsigned
 //! equality and `<`.
@@ -33,8 +33,8 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
-/// Maximum supported bit-vector width (fits a `u64` word).
-pub const MAX_WIDTH: u8 = 64;
+/// Maximum supported bit-vector width (fits a `u128` word).
+pub const MAX_WIDTH: u8 = 128;
 
 /// A binary bit-vector operation; operands and result share one width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -58,15 +58,15 @@ pub enum BvTerm {
     Var {
         /// Dense variable id.
         id: u32,
-        /// Width in bits, `1..=64`.
+        /// Width in bits, `1..=128`.
         width: u8,
     },
     /// A constant, stored masked to `width` bits.
     Const {
-        /// Width in bits, `1..=64`.
+        /// Width in bits, `1..=128`.
         width: u8,
         /// The masked constant value.
-        value: u64,
+        value: u128,
     },
     /// Bitwise negation.
     Not {
@@ -115,13 +115,13 @@ pub enum BvTerm {
     },
 }
 
-/// Mask with the low `w` bits set (`w` in `1..=64`).
+/// Mask with the low `w` bits set (`w` in `1..=128`).
 #[inline]
-pub(crate) fn mask(w: u8) -> u64 {
+pub(crate) fn mask(w: u8) -> u128 {
     if w >= MAX_WIDTH {
-        u64::MAX
+        u128::MAX
     } else {
-        (1u64 << w) - 1
+        (1u128 << w) - 1
     }
 }
 
@@ -140,7 +140,7 @@ impl BvTerm {
     }
 
     /// A constant of `width` bits; `value` is masked to the width.
-    pub fn constant(width: u8, value: u64) -> Option<BvTerm> {
+    pub fn constant(width: u8, value: u128) -> Option<BvTerm> {
         if width_ok(width) {
             Some(BvTerm::Const {
                 width,
@@ -311,7 +311,7 @@ impl BvAssertion {
 /// Returns `None` for malformed terms or out-of-range variable ids.
 /// Iterative (explicit stack): adversarially deep terms cannot overflow
 /// the call stack.
-pub fn eval_bv(term: &BvTerm, env: &[u64]) -> Option<u64> {
+pub fn eval_bv(term: &BvTerm, env: &[u128]) -> Option<u128> {
     enum Item<'a> {
         Enter(&'a BvTerm),
         Merge(&'a BvTerm),
@@ -320,7 +320,7 @@ pub fn eval_bv(term: &BvTerm, env: &[u64]) -> Option<u64> {
         t as *const BvTerm as usize
     }
     // Compute a node's value from its children's completed results.
-    fn compute(t: &BvTerm, env: &[u64], done: &BTreeMap<usize, u64>) -> Option<u64> {
+    fn compute(t: &BvTerm, env: &[u128], done: &BTreeMap<usize, u128>) -> Option<u128> {
         let kid = |c: &BvTerm| done.get(&addr(c)).copied();
         match t {
             BvTerm::Var { id, .. } => env_get(env, *id).copied(),
@@ -362,7 +362,7 @@ pub fn eval_bv(term: &BvTerm, env: &[u64]) -> Option<u64> {
     }
 
     let mut stack = alloc::vec![Item::Enter(term)];
-    let mut done: BTreeMap<usize, u64> = BTreeMap::new();
+    let mut done: BTreeMap<usize, u128> = BTreeMap::new();
     while let Some(item) = stack.pop() {
         match item {
             Item::Enter(t) => match t {
@@ -398,12 +398,12 @@ pub fn eval_bv(term: &BvTerm, env: &[u64]) -> Option<u64> {
     done.get(&addr(term)).copied()
 }
 
-fn env_get(env: &[u64], id: u32) -> Option<&u64> {
+fn env_get(env: &[u128], id: u32) -> Option<&u128> {
     env.get(id as usize)
 }
 
 /// Does `a` hold under the word assignment `values`?
-fn assertion_holds(a: &BvAssertion, values: &[u64]) -> Option<bool> {
+fn assertion_holds(a: &BvAssertion, values: &[u128]) -> Option<bool> {
     match a {
         BvAssertion::Eq(l, r) => Some(eval_bv(l, values)? == eval_bv(r, values)?),
         BvAssertion::Ult(l, r) => Some(eval_bv(l, values)? < eval_bv(r, values)?),
@@ -505,7 +505,7 @@ impl Blaster {
         out
     }
 
-    fn const_bits(&self, w: usize, value: u64) -> Vec<i32> {
+    fn const_bits(&self, w: usize, value: u128) -> Vec<i32> {
         (0..w)
             .map(|k| {
                 if (value >> k) & 1 == 1 {
@@ -754,7 +754,7 @@ pub fn blast_bv(var_count: u32, assertions: &[BvAssertion]) -> Option<BlastedBv>
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BvModel {
     /// Word value per variable id.
-    pub values: Vec<u64>,
+    pub values: Vec<u128>,
 }
 
 /// Evidence shipped with an UNSAT claim: the blasted CNF plus the CDCL proof
@@ -790,14 +790,14 @@ pub fn solve_bv(var_count: u32, assertions: &[BvAssertion], fuel: u64) -> Option
     match ans.result {
         SolveResult::Sat => {
             let bits = ans.model?;
-            let mut values = vec![0u64; var_count as usize];
+            let mut values = vec![0u128; var_count as usize];
             for (id, wb) in blasted.var_bits.iter().enumerate() {
-                let mut v = 0u64;
+                let mut v = 0u128;
                 for (k, &l) in wb.iter().enumerate() {
                     let assigned = *bits.get((l.unsigned_abs() - 1) as usize)?;
                     let lit_true = if l > 0 { assigned } else { !assigned };
-                    if lit_true && k < 64 {
-                        v |= 1u64 << k;
+                    if lit_true && k < 128 {
+                        v |= 1u128 << k;
                     }
                 }
                 values[id] = v;
@@ -829,7 +829,7 @@ mod tests {
     fn v(id: u32, w: u8) -> BvTerm {
         BvTerm::var(id, w).unwrap()
     }
-    fn k(w: u8, val: u64) -> BvTerm {
+    fn k(w: u8, val: u128) -> BvTerm {
         BvTerm::constant(w, val).unwrap()
     }
     fn eq(l: BvTerm, r: BvTerm) -> BvAssertion {
@@ -865,27 +865,39 @@ mod tests {
     }
 
     #[test]
+    fn wide_128_bit_wrapping_is_exact() {
+        // x + 1 == 0 at 128 bits forces x = 2^128 - 1. A 64-bit mask would
+        // make the constant 1 wrap at the wrong place.
+        let x = v(0, 128);
+        let asserts = vec![eq(BvTerm::add(x, k(128, 1)).unwrap(), k(128, 0))];
+        match solve_bv(1, &asserts, 10_000_000) {
+            Some(BvOutcome::Sat(m)) => assert_eq!(m.values[0], u128::MAX),
+            other => panic!("x + 1 == 0 at 128 bits should be SAT, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn blast_bv_agrees_with_semantics() {
         // Trusted oracle: random QF_BV assertions must be equisatisfiable between
         // the semantic evaluator (`eval_bv`) and the bit-blast encoder. A mismatch
         // means the encoder over-/under-constrains. Catches blast soundness bugs.
-        struct Lcg(u64);
+        struct Lcg(u128);
         impl Lcg {
-            fn next(&mut self) -> u64 {
+            fn next(&mut self) -> u128 {
                 self.0 = self
                     .0
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
                 self.0
             }
-            fn below(&mut self, n: u64) -> u64 {
+            fn below(&mut self, n: u128) -> u128 {
                 self.next() % n
             }
         }
         let mut rng = Lcg(0x9e3779b9);
         fn gen_term(rng: &mut Lcg, vars: u32, depth: u32) -> BvTerm {
             if depth == 0 || rng.below(3) == 0 {
-                return BvTerm::var(rng.below(vars as u64) as u32, 3).unwrap();
+                return BvTerm::var(rng.below(vars as u128) as u32, 3).unwrap();
             }
             let a = gen_term(rng, vars, depth - 1);
             let b = gen_term(rng, vars, depth - 1);
@@ -906,10 +918,10 @@ mod tests {
             let asserts = vec![eq(t1.clone(), t2.clone())];
             // Semantic satisfiability via exhaustive enumeration.
             let mut semantic = false;
-            let total = 1u64 << (3 * vars);
-            let mut assign = 0u64;
+            let total = 1u128 << (3 * vars);
+            let mut assign = 0u128;
             while assign < total {
-                let mut vals: Vec<u64> = Vec::with_capacity(vars as usize);
+                let mut vals: Vec<u128> = Vec::with_capacity(vars as usize);
                 for vi in 0..vars {
                     vals.push((assign >> (3 * vi)) & 0b111);
                 }
@@ -954,8 +966,8 @@ mod tests {
 
         // Brute-force ground truth (3-bit variables => 8*8 cases).
         let mut satisfiable = false;
-        for a in 0..8u64 {
-            for b in 0..8u64 {
+        for a in 0..8u128 {
+            for b in 0..8u128 {
                 if let Some(true) = assertion_holds(&asserts[0], &[a, b]) {
                     satisfiable = true;
                 }
@@ -972,8 +984,10 @@ mod tests {
     #[test]
     fn constructor_width_validation() {
         assert!(BvTerm::var(0, 0).is_none());
-        assert!(BvTerm::var(0, 65).is_none());
-        assert!(BvTerm::concat(v(0, 40), v(1, 30)).is_none()); // 70 > 64
+        assert!(BvTerm::var(0, 128).is_some());
+        assert!(BvTerm::var(0, 129).is_none());
+        assert!(BvTerm::concat(v(0, 100), v(1, 40)).is_none()); // 140 > 128
+        assert!(BvTerm::concat(v(0, 64), v(1, 64)).is_some()); // exactly 128
         let t = v(0, 8);
         assert!(BvTerm::extract(t.clone(), 8, 0).is_none()); // hi >= width
         assert!(BvTerm::extract(t.clone(), 6, 7).is_none()); // lo > hi
@@ -998,7 +1012,7 @@ mod tests {
         assert_eq!(eval_bv(&BvTerm::not(k(4, 0)).unwrap(), &[]), Some(15));
         // Shifts: overshoot yields zero.
         let x = v(0, 8);
-        let env = [0b1010_1100u64];
+        let env = [0b1010_1100u128];
         assert_eq!(
             eval_bv(&BvTerm::shl(x.clone(), 2).unwrap(), &env),
             Some(0b1011_0000)
@@ -1109,8 +1123,8 @@ mod oracle {
     fn w() -> impl Strategy<Value = u8> {
         1u8..=3
     }
-    fn konst() -> impl Strategy<Value = u64> {
-        0u64..8
+    fn konst() -> impl Strategy<Value = u128> {
+        0u128..8
     }
     fn decode_op(i: u8) -> BvBinOp {
         match i {
@@ -1155,7 +1169,7 @@ mod oracle {
             }
 
             // Ground truth by enumeration.
-            let domain = 1u64 << width;
+            let domain = 1u128 << width;
             let mut truth_sat = false;
             'outer: for vx in 0..domain {
                 for vy in 0..domain {

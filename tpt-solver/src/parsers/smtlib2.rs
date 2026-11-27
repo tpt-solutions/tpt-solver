@@ -16,7 +16,7 @@
 //!   non-strict counterparts.
 //! * Arithmetic `+ - * /` where `*`/`/` take a constant numeric operand, so the term
 //!   stays *linear* (QF_LRA). Integer-sorted variables are handled as reals.
-//! * Bit vectors (`QF_BV`): `(_ BitVec n)` sorts with `n <= 64`, literals
+//! * Bit vectors (`QF_BV`): `(_ BitVec n)` sorts with `n <= 128`, literals
 //!   `#x..`/`#b..`, operators `bvnot bvneg bvand bvor bvxor bvadd bvsub bvshl
 //!   bvlshr bvult concat ((_ extract i j) t)`. Shifts must be by constant
 //!   literals.
@@ -260,7 +260,7 @@ pub(crate) enum Term {
     Bool(bool),
     Num(Rational),
     /// A bit-vector constant with its width (from `#x..` / `#b..` literals).
-    BvLit(u64, u8),
+    BvLit(u128, u8),
     Sym(String),
     App(Op, Vec<Term>),
     /// `((_ extract hi lo) t)` — carries the bit range Op cannot.
@@ -408,20 +408,20 @@ fn atom_to_term(a: &str) -> Term {
 }
 
 /// Parse `#b0101` / `#xAB` bit-vector literals into `(value, width)`.
-/// Widths above 64 bits are out of subset (`None`, surfacing as an unknown
+/// Widths above 128 bits are out of subset (`None`, surfacing as an unknown
 /// symbol and later [`SmtError::Unsupported`]).
 fn parse_bv_literal(a: &str) -> Option<Term> {
     let (val, width) = match a.strip_prefix("#x") {
-        Some(hex) if !hex.is_empty() && hex.len() <= 16 => {
-            (u64::from_str_radix(hex, 16).ok()?, (hex.len() * 4) as u8)
+        Some(hex) if !hex.is_empty() && hex.len() <= 32 => {
+            (u128::from_str_radix(hex, 16).ok()?, (hex.len() * 4) as u8)
         }
         Some(hex) if !hex.is_empty() => return None,
         _ => {
             let bin = a.strip_prefix("#b")?;
-            if bin.is_empty() || bin.len() > 64 {
+            if bin.is_empty() || bin.len() > 128 {
                 return None;
             }
-            (u64::from_str_radix(bin, 2).ok()?, bin.len() as u8)
+            (u128::from_str_radix(bin, 2).ok()?, bin.len() as u8)
         }
     };
     Some(Term::BvLit(val, width))
@@ -500,7 +500,7 @@ enum Sort {
     Bool,
     Real,
     Int,
-    /// `(_ BitVec n)` with `n <= 64`.
+    /// `(_ BitVec n)` with `n <= 128`.
     BitVec(u32),
     /// `(Array S T)` — element universe is the suite's `u64` regardless of S/T
     /// (a documented limitation of the QF_AX subset).
@@ -620,15 +620,15 @@ impl Script {
     /// supports.
     ///
     /// Returns [`SmtError::Unsupported`] for disjunctions, shifts by
-    /// non-constant amounts, widths above 64, or any term outside the
+    /// non-constant amounts, widths above 128, or any term outside the
     /// fragment.
     pub fn to_bv(&self) -> Result<BvProblem, SmtError> {
         let mut ctx = BvCtx::default();
         for d in &self.decls {
             if let Sort::BitVec(w) = d.sort {
-                if w == 0 || w > 64 {
+                if w == 0 || w > 128 {
                     return Err(SmtError::Unsupported(format!(
-                        "bit-vector width {} out of the supported 1..=64",
+                        "bit-vector width {} out of the supported 1..=128",
                         w
                     )));
                 }
@@ -1408,7 +1408,7 @@ fn bv_term(term: &Term, ctx: &BvCtx) -> Result<BvTerm, SmtError> {
             let a = bv_term(arg, ctx)?;
             let hi = u8::try_from(range.hi)
                 .ok()
-                .filter(|&h| h < 64)
+                .filter(|&h| h < 128)
                 .ok_or_else(|| SmtError::Unsupported("extract index out of range".into()))?;
             let lo = u8::try_from(range.lo)
                 .ok()
@@ -1462,15 +1462,15 @@ fn bv_term(term: &Term, ctx: &BvCtx) -> Result<BvTerm, SmtError> {
                 Op::Concat => {
                     need(2)?;
                     BvTerm::concat(a0()?, a1()?).ok_or_else(|| {
-                        SmtError::Unsupported("concatenation exceeds 64 bits".into())
+                        SmtError::Unsupported("concatenation exceeds 128 bits".into())
                     })
                 }
                 Op::BvShl | Op::BvLShr => {
                     need(2)?;
                     let amt = match &args[1] {
-                        // Amounts >= any width collapse to "yield 0", so 64 is
-                        // a faithful saturation point for widths <= 64.
-                        Term::BvLit(v, _) => Some((*v).min(64) as u8),
+                        // Amounts >= any width collapse to "yield 0", so 128 is
+                        // a faithful saturation point for widths <= 128.
+                        Term::BvLit(v, _) => Some((*v).min(128) as u8),
                         _ => None,
                     }
                     .ok_or_else(|| {

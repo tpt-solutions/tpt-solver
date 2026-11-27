@@ -422,7 +422,7 @@ pub struct BvCertified {
     /// The kernel's verdict on `claim` and its witness.
     pub verdict: Outcome,
     /// Word value per variable id, present on a SAT claim.
-    pub model: Option<Vec<u64>>,
+    pub model: Option<Vec<u128>>,
     /// DRAT-style proof clauses for the bit-blast, present on an UNSAT claim.
     pub proof: Option<Vec<Vec<i32>>>,
 }

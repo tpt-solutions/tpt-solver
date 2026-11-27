@@ -19,18 +19,18 @@ use tpt_solver_core::bv::{BvAssertion, BvBinOp, BvModel, BvTerm, BvUnsatCert};
 /// Maximum accepted term depth; deeper inputs are [`Outcome::Inconclusive`].
 const MAX_DEPTH: u32 = 2048;
 
-fn mask(w: u8) -> u64 {
-    if w >= 64 {
-        u64::MAX
+fn mask(w: u8) -> u128 {
+    if w >= 128 {
+        u128::MAX
     } else if w == 0 {
         0
     } else {
-        (1u64 << w) - 1
+        (1u128 << w) - 1
     }
 }
 
 /// Independent evaluation of a term under `env` (`env[id]` = value).
-fn eval(term: &BvTerm, env: &[u64], d: u32) -> Option<u64> {
+fn eval(term: &BvTerm, env: &[u128], d: u32) -> Option<u128> {
     if d > MAX_DEPTH {
         return None;
     }
@@ -79,7 +79,7 @@ fn eval(term: &BvTerm, env: &[u64], d: u32) -> Option<u64> {
 
 /// Does one assertion hold under the model? `None` on malformed input or an
 /// out-of-range variable id.
-fn holds(a: &BvAssertion, values: &[u64]) -> Option<bool> {
+fn holds(a: &BvAssertion, values: &[u128]) -> Option<bool> {
     match a {
         BvAssertion::Eq(l, r) => Some(eval(l, values, 0)? == eval(r, values, 0)?),
         BvAssertion::Ult(l, r) => Some(eval(l, values, 0)? < eval(r, values, 0)?),
@@ -150,7 +150,7 @@ mod tests {
     fn v(id: u32, w: u8) -> BvTerm {
         BvTerm::var(id, w).unwrap()
     }
-    fn k(w: u8, val: u64) -> BvTerm {
+    fn k(w: u8, val: u128) -> BvTerm {
         BvTerm::constant(w, val).unwrap()
     }
 

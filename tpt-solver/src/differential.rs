@@ -417,7 +417,7 @@ fn gen_bv_term(rng: &mut Lcg, vars: u32, width: u8, depth: u32) -> BvTerm {
             BvTerm::not(inner).expect("well-formed")
         }
         1 => {
-            let k = rng.next() & mask;
+            let k = u128::from(rng.next()) & mask;
             BvTerm::constant(width, k).expect("well-formed")
         }
         2 | 3 => {
@@ -469,11 +469,11 @@ fn gen_bv_term(rng: &mut Lcg, vars: u32, width: u8, depth: u32) -> BvTerm {
     }
 }
 
-fn crate_mask(w: u8) -> u64 {
-    if w >= 64 {
-        u64::MAX
+fn crate_mask(w: u8) -> u128 {
+    if w >= 128 {
+        u128::MAX
     } else {
-        (1u64 << w) - 1
+        (1u128 << w) - 1
     }
 }
 

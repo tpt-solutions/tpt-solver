@@ -136,7 +136,7 @@ Solutions.
 
 - [x] BitVector theory in core + matching checker in `tpt-solver-check`
       (`tpt-solver-core/src/bv.rs` + `tpt-solver-check/src/bv.rs`). Fragment:
-      fixed-width (≤64-bit) word-level terms over var/const/not/neg/and/or/
+      fixed-width (≤128-bit) word-level terms over var/const/not/neg/and/or/
       xor/add/sub, constant shifts, concat and extract; assertions are unsigned
       equality and `<`. Decision procedure is eager **bit-blasting onto the
       existing certified CDCL** (`sat::solve_cnf`) — SAT answers are decoded to

@@ -7,6 +7,9 @@ All notable changes to tpt-solver are recorded here. The format is based on
 
 ### Added
 
+- QF_BV bit-vectors now support widths up to 128 bits (was 64). Values, the
+  evaluator, the independent checker, and the SMT-LIB2 literals and `concat` /
+  `extract` limits all moved to 128 bits.
 - `api` module: `solve_str` and `solve_file` return a `Report` with the checker
   verdict, model, proof and core. The `prelude` module collects the common names.
 - `check` subcommand, which verifies a proof file against its problem without
