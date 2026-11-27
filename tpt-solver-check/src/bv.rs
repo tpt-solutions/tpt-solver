@@ -14,7 +14,7 @@
 use crate::lrat::{check_proof, LratProof, LratStep};
 use crate::outcome::Outcome;
 use alloc::vec::Vec;
-use tpt_solver_core::bv::{BvAssertion, BvBinOp, BvModel, BvTerm, BvUnsatCert};
+use tpt_solver_core::bv::{BvAssertion, BvBinOp, BvFormula, BvModel, BvTerm, BvUnsatCert};
 
 /// Maximum accepted term depth; deeper inputs are [`Outcome::Inconclusive`].
 const MAX_DEPTH: u32 = 2048;
@@ -84,6 +84,46 @@ fn holds(a: &BvAssertion, values: &[u128]) -> Option<bool> {
         BvAssertion::Eq(l, r) => Some(eval(l, values, 0)? == eval(r, values, 0)?),
         BvAssertion::Ult(l, r) => Some(eval(l, values, 0)? < eval(r, values, 0)?),
     }
+}
+
+/// Whether a Boolean formula holds under the model. Written separately from
+/// the engine's copy, for the same reason as [`holds`].
+fn formula_holds(f: &BvFormula, values: &[u128]) -> Option<bool> {
+    Some(match f {
+        BvFormula::Const(b) => *b,
+        BvFormula::Atom(a) => holds(a, values)?,
+        BvFormula::Not(inner) => !formula_holds(inner, values)?,
+        BvFormula::And(parts) => {
+            let mut all = true;
+            for part in parts {
+                all &= formula_holds(part, values)?;
+            }
+            all
+        }
+        BvFormula::Or(parts) => {
+            let mut any = false;
+            for part in parts {
+                any |= formula_holds(part, values)?;
+            }
+            any
+        }
+    })
+}
+
+/// Verify a claimed SAT model against a conjunction of Boolean formulas. The
+/// verdicts are those of [`check_bv_model`].
+pub fn check_bv_formula_model(formulas: &[BvFormula], model: &BvModel, var_count: u32) -> Outcome {
+    if model.values.len() < var_count as usize {
+        return Outcome::Inconclusive;
+    }
+    for f in formulas {
+        match formula_holds(f, &model.values) {
+            Some(true) => {}
+            Some(false) => return Outcome::Reject,
+            None => return Outcome::Inconclusive,
+        }
+    }
+    Outcome::Accept
 }
 
 /// Verify a claimed SAT model by substituting it into the original assertions.
@@ -202,5 +242,58 @@ mod tests {
             proof: vec![vec![]],
         };
         assert!(check_bv_unsat(&cert).is_reject());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod formula_kernel_tests {
+    use super::*;
+    use alloc::{boxed::Box, vec};
+    use tpt_solver_core::bv::{solve_bv_formulas, BvOutcome};
+
+    fn x() -> BvTerm {
+        BvTerm::var(0, 2).unwrap()
+    }
+
+    fn c(value: u128) -> BvTerm {
+        BvTerm::constant(2, value).unwrap()
+    }
+
+    fn eq(value: u128) -> BvFormula {
+        BvFormula::Atom(BvAssertion::eq(x(), c(value)).unwrap())
+    }
+
+    #[test]
+    fn unsat_formula_certificate_is_accepted() {
+        // x is 0 or 1, not 0, not 1.
+        let formulas = vec![
+            BvFormula::Or(vec![eq(0), eq(1)]),
+            BvFormula::Not(Box::new(eq(0))),
+            BvFormula::Not(Box::new(eq(1))),
+        ];
+        match solve_bv_formulas(1, &formulas, 10_000_000) {
+            Some(BvOutcome::Unsat(cert)) => assert_eq!(check_bv_unsat(&cert), Outcome::Accept),
+            other => panic!("expected UNSAT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sat_formula_model_is_accepted_and_a_wrong_model_is_rejected() {
+        let formulas = vec![BvFormula::Or(vec![eq(3), eq(0)])];
+        match solve_bv_formulas(1, &formulas, 10_000_000) {
+            Some(BvOutcome::Sat(model)) => {
+                assert_eq!(
+                    check_bv_formula_model(&formulas, &model, 1),
+                    Outcome::Accept
+                );
+                let wrong = BvModel { values: vec![1] };
+                assert_eq!(
+                    check_bv_formula_model(&formulas, &wrong, 1),
+                    Outcome::Reject
+                );
+            }
+            other => panic!("expected SAT, got {other:?}"),
+        }
     }
 }
