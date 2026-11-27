@@ -352,7 +352,8 @@ fn bv_term_to_smt2(t: &BvTerm) -> String {
                 BvBinOp::Or => "bvor",
                 BvBinOp::Xor => "bvxor",
                 BvBinOp::Add => "bvadd",
-                _ => "bvsub",
+                BvBinOp::Mul => "bvmul",
+                BvBinOp::Sub => "bvsub",
             };
             format!(
                 "({} {} {})",
@@ -436,6 +437,7 @@ fn gen_bv_term(rng: &mut Lcg, vars: u32, width: u8, depth: u32) -> BvTerm {
                 BvBinOp::Xor => BvTerm::xor(l, r),
                 BvBinOp::Add => BvTerm::add(l, r),
                 BvBinOp::Sub => BvTerm::sub(l, r),
+                BvBinOp::Mul => BvTerm::mul(l, r),
             }
             .expect("same-width operands")
         }

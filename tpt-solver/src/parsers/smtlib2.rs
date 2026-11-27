@@ -17,7 +17,7 @@
 //! * Arithmetic `+ - * /` where `*`/`/` take a constant numeric operand, so the term
 //!   stays *linear* (QF_LRA). Integer-sorted variables are handled as reals.
 //! * Bit vectors (`QF_BV`): `(_ BitVec n)` sorts with `n <= 128`, literals
-//!   `#x..`/`#b..`, operators `bvnot bvneg bvand bvor bvxor bvadd bvsub bvshl
+//!   `#x..`/`#b..`, operators `bvnot bvneg bvand bvor bvxor bvadd bvsub bvmul bvshl
 //!   bvlshr bvult concat ((_ extract i j) t)`. Shifts must be by constant
 //!   literals.
 //! * Arrays (`QF_AX`): `(Array S T)` sorts, `select`/`store`, and constant
@@ -235,6 +235,7 @@ pub(crate) enum Op {
     BvXor,
     BvAdd,
     BvSub,
+    BvMul,
     /// Logical left shift; the amount must be a constant literal.
     BvShl,
     /// Logical right shift; the amount must be a constant literal.
@@ -294,6 +295,7 @@ fn op_from_str(s: &str) -> Option<Op> {
         "bvxor" => Op::BvXor,
         "bvadd" => Op::BvAdd,
         "bvsub" => Op::BvSub,
+        "bvmul" => Op::BvMul,
         "bvshl" => Op::BvShl,
         "bvlshr" => Op::BvLShr,
         "bvult" => Op::BvUlt,
@@ -1172,6 +1174,7 @@ impl Encoder {
                 | Op::BvXor
                 | Op::BvAdd
                 | Op::BvSub
+                | Op::BvMul
                 | Op::BvShl
                 | Op::BvLShr
                 | Op::BvUlt
@@ -1446,6 +1449,10 @@ fn bv_term(term: &Term, ctx: &BvCtx) -> Result<BvTerm, SmtError> {
                 Op::BvSub => {
                     need(2)?;
                     BvTerm::sub(a0()?, a1()?).ok_or_else(width_mismatch)
+                }
+                Op::BvMul => {
+                    need(2)?;
+                    BvTerm::mul(a0()?, a1()?).ok_or_else(width_mismatch)
                 }
                 Op::BvAnd => {
                     need(2)?;

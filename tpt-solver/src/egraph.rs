@@ -574,6 +574,7 @@ fn add_term(eg: &mut EGraph, term: &Term) -> Result<Id, SmtError> {
             | Op::BvXor
             | Op::BvAdd
             | Op::BvSub
+            | Op::BvMul
             | Op::BvShl
             | Op::BvLShr
             | Op::BvUlt
